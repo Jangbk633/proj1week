@@ -44,10 +44,13 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
   </section>
 
   <div class="sample-chips">
-    <span class="sample-label">이번에 살펴볼 이슈</span>
-    <button class="chip active" onclick="loadIssue('rate', this)">한국은행 기준금리 동결</button>
-    <button class="chip" onclick="loadIssue('medical', this)">의대 정원 확대 갈등</button>
-    <button class="chip" onclick="loadIssue('semi', this)">반도체 클러스터 보조금·전력망</button>
+    <span class="sample-label">news.db 실시간 RAG 이슈</span>
+    <button class="chip active" onclick="searchByKeyword('김여정 대남 확성기 국경선 대응수단', this)">김여정 대남 확성기 위협 (news.db)</button>
+    <button class="chip" onclick="searchByKeyword('수사기관장 배석 검찰개혁 조희대', this)">수사기관장 배석·검찰개혁 (news.db)</button>
+    <button class="chip" onclick="searchByKeyword('전업주부 국민연금 사각지대 해소', this)">전업주부 국민연금 편입 (news.db)</button>
+    <button class="chip" onclick="searchByKeyword('한미연합훈련 상시훈련 주한미군', this)">한미연합훈련·주한미군 (news.db)</button>
+    <button class="chip" onclick="loadIssue('rate', this)">예시: 기준금리 동결</button>
+    <button class="chip" onclick="loadIssue('medical', this)">예시: 의대 정원 갈등</button>
   </div>
 
   <!-- 사용자 업로드 와이어프레임과 동일한 레이아웃 프레임 -->
@@ -273,7 +276,7 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         .map((p) => `<li>${p}</li>`)
         .join("");
       document.getElementById("claim1Press").innerHTML = data.claim1Press
-        .map((p) => `<a class="press-badge" href="#source" title="${p.title}">${p.name} ↗</a>`)
+        .map((p) => `<a class="press-badge" href="${p.url || '#source'}" target="_blank" rel="noopener noreferrer" title="${p.title}">${p.name} ↗</a>`)
         .join("");
 
       document.getElementById("claim2Title").textContent = data.claim2Title;
@@ -282,7 +285,7 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         .map((p) => `<li>${p}</li>`)
         .join("");
       document.getElementById("claim2Press").innerHTML = data.claim2Press
-        .map((p) => `<a class="press-badge" href="#source" title="${p.title}">${p.name} ↗</a>`)
+        .map((p) => `<a class="press-badge" href="${p.url || '#source'}" target="_blank" rel="noopener noreferrer" title="${p.title}">${p.name} ↗</a>`)
         .join("");
     }
 
@@ -292,10 +295,24 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
       renderIssue(ISSUE_DATA[key]);
     }
 
+    async function searchByKeyword(q, btn) {
+      document.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
+      if (btn) btn.classList.add("active");
+      document.getElementById("queryInput").value = q;
+      await runQuery(q);
+    }
+
     async function handleSearch(e) {
       e.preventDefault();
       const q = document.getElementById("queryInput").value.trim();
       if (!q) return;
+      document.querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
+      await runQuery(q);
+    }
+
+    async function runQuery(q) {
+      document.getElementById("headlineText").textContent = `‘${q}’ 관련 기사를 수집·비교 분석 중입니다...`;
+      document.getElementById("headlineMeta").innerHTML = `<span>news.db 검색 및 신문사별 실시간 크롤링·요약 진행 중</span>`;
 
       // FastAPI 서버(/api/analyze)가 실행 중이면 API 호출, 정적 파일 열기 상태면 로컬 매칭
       try {
@@ -355,6 +372,10 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         });
       }
     }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      runQuery("김여정 대북 확성기 철거 남북관계");
+    });
   </script>
 
 
