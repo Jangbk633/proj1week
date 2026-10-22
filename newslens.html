@@ -233,11 +233,11 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
           </div>
         </div>
 
-        <!-- 기사별 개별 판단 카드 그리드 -->
+        <!-- 기사별 개별 판단 카드 그리드 (관점 A / 관점 B 그룹별 밀착 배치) -->
         <div style="font-size:12px; font-weight:800; color:var(--text-sub); margin-bottom:10px;">
-          수집 기사별 개별 AI 판단 내역 (관점 분류 · 논조 판정 · 연관도)
+          수집 기사별 개별 AI 판단 내역 (관점 A · 관점 B 그룹별 모아보기)
         </div>
-        <div id="articleJudgmentsList" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); gap:12px;">
+        <div id="articleJudgmentsList" class="claims-grid" style="gap:18px; align-items:start;">
         </div>
       </section>
     </div>
@@ -425,37 +425,54 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
       if (ajList.length === 0) {
         listEl.innerHTML = `<div style="grid-column:1/-1; padding:14px; background:#fff; border:1px dashed #cbd5b0; border-radius:10px; font-size:12.5px; color:var(--text-muted);">수집된 신뢰 근거 기사가 없어 개별 기사 판단을 생략했습니다 (환각 차단 작동).</div>`;
       } else {
-        listEl.innerHTML = ajList
-          .map((item) => {
-            const isA = (item.stance || "").includes("관점 A");
-            const bgBadge = isA ? "var(--claim1-bg)" : "var(--claim2-bg)";
-            const colBadge = isA ? "var(--claim1-accent)" : "var(--claim2-accent)";
-            return `
-              <div style="background:#fff; border:1px solid var(--border-soft); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; justify-content:space-between; gap:10px;">
-                <div>
-                  <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:8px;">
-                    <span style="font-size:11px; font-weight:800; padding:3px 8px; border-radius:6px; background:${bgBadge}; color:${colBadge};">
-                      ${item.press} · ${item.stance}
-                    </span>
-                    <span style="font-size:11px; font-weight:700; color:var(--text-muted);">
-                      연관도 ${item.relevanceScore}%
-                    </span>
-                  </div>
-                  <div style="font-size:13px; font-weight:800; line-height:1.45; margin-bottom:6px; color:var(--text-main);">
-                    ${item.title}
-                  </div>
-                  <div style="font-size:12px; color:var(--text-sub); line-height:1.6;">
-                    ${item.judgmentSummary}
-                  </div>
+        const groupA = ajList.filter((item) => (item.stance || "").includes("관점 A"));
+        const groupB = ajList.filter((item) => !(item.stance || "").includes("관점 A"));
+
+        const renderCard = (item, isA) => {
+          const bgBadge = isA ? "var(--claim1-bg)" : "var(--claim2-bg)";
+          const colBadge = isA ? "var(--claim1-accent)" : "var(--claim2-accent)";
+          return `
+            <div style="background:#fff; border:1px solid var(--border-soft); border-radius:10px; padding:13px 15px; display:flex; flex-direction:column; justify-content:space-between; gap:8px;">
+              <div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:6px;">
+                  <span style="font-size:11px; font-weight:800; padding:3px 8px; border-radius:6px; background:${bgBadge}; color:${colBadge};">
+                    ${item.press} · ${item.stance}
+                  </span>
+                  <span style="font-size:11px; font-weight:700; color:var(--text-muted);">
+                    연관도 ${item.relevanceScore}%
+                  </span>
                 </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; padding-top:8px; border-top:1px dashed var(--border-soft); font-size:11px;">
-                  <span style="font-weight:700; color:#5a6b47;">논조: ${item.tone}</span>
-                  <a class="press-badge" href="${item.url || '#source'}" target="_blank" rel="noopener noreferrer">원문 보기 ↗</a>
+                <div style="font-size:13px; font-weight:800; line-height:1.45; margin-bottom:5px; color:var(--text-main);">
+                  ${item.title}
+                </div>
+                <div style="font-size:12px; color:var(--text-sub); line-height:1.6;">
+                  ${item.judgmentSummary}
                 </div>
               </div>
-            `;
-          })
-          .join("");
+              <div style="display:flex; justify-content:space-between; align-items:center; padding-top:8px; border-top:1px dashed var(--border-soft); font-size:11px;">
+                <span style="font-weight:700; color:#5a6b47;">논조: ${item.tone}</span>
+                <a class="press-badge" href="${item.url || '#source'}" target="_blank" rel="noopener noreferrer">원문 보기 ↗</a>
+              </div>
+            </div>
+          `;
+        };
+
+        listEl.innerHTML = `
+          <div style="background:#f6f9e8; border:1px solid #dce4c0; border-radius:14px; padding:14px; display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:4px 4px 6px; border-bottom:1px solid #dce4c0;">
+              <span style="font-size:12px; font-weight:800; color:var(--claim1-accent);">관점 A 판정 기사 모음 (${groupA.length}건)</span>
+              <span style="font-size:11px; color:var(--text-muted);">${groupA.map((x) => x.press).join(" · ")}</span>
+            </div>
+            ${groupA.map((item) => renderCard(item, true)).join("") || '<div style="font-size:12px; color:var(--text-muted); padding:8px;">해당 관점 기사 없음</div>'}
+          </div>
+          <div style="background:#eef7fb; border:1px solid #cde2ec; border-radius:14px; padding:14px; display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:4px 4px 6px; border-bottom:1px solid #cde2ec;">
+              <span style="font-size:12px; font-weight:800; color:var(--claim2-accent);">관점 B 판정 기사 모음 (${groupB.length}건)</span>
+              <span style="font-size:11px; color:var(--text-muted);">${groupB.map((x) => x.press).join(" · ")}</span>
+            </div>
+            ${groupB.map((item) => renderCard(item, false)).join("") || '<div style="font-size:12px; color:var(--text-muted); padding:8px;">해당 관점 기사 없음</div>'}
+          </div>
+        `;
       }
     }
 

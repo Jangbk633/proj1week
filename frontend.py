@@ -26,6 +26,13 @@ HOST = "127.0.0.1"
 PORT = 8000
 URL = f"http://{HOST}:{PORT}"
 
+if ENV_FILE.exists():
+    for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 try:
     from dotenv import load_dotenv
 
@@ -33,10 +40,10 @@ try:
 except ImportError:
     pass
 
-# 사용자 지정 Unsloth 로컬 OpenAI 호환 API 기본 설정
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8889/v1").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "sk-unsloth-f65f99d826c89c73362ddeb617e7963e").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF").strip()
+# 사용자 지정 Unsloth 로컬 OpenAI 호환 API 기본 설정 (.env 또는 기본값 사용)
+OPENAI_BASE_URL = (os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:8889/v1").strip()
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "sk-unsloth-f65f99d826c89c73362ddeb617e7963e").strip()
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF").strip()
 
 # 1. Unsloth 로컬 OpenAI API 클라이언트 설정 (가상환경 외부에서 런처 실행 시에도 에러 없이 통과하도록 처리)
 try:
@@ -252,6 +259,11 @@ def judge_articles_with_openai(
                 "judgmentSummary": j_summary,
             }
         )
+
+    # 관점 A 기사와 관점 B 기사가 서로 관점별로 붙어 있도록 정렬
+    article_judgments.sort(
+        key=lambda x: (0 if "관점 A" in x.get("stance", "") else 1, -int(x.get("relevanceScore", 0)))
+    )
 
     press_set = sorted({a.get("press", "") for a in raw_articles if a.get("press")})
     if live_openai_ok:
