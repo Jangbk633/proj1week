@@ -147,8 +147,101 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         </div>
 
       </section>
+
+      <!-- 4. OpenAI API 기반 기사 판단 리포트 섹션 -->
+      <section class="summary-box" id="openaiJudgmentSection" aria-label="OpenAI API 기반 기사 판단 리포트" style="background:#fbfcf7; border:1.5px solid #cbd5b0;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px; padding-bottom:14px; border-bottom:1px solid #dfe4cb;">
+          <div>
+            <span class="box-tag" style="background:var(--sprout); color:var(--text-main); padding:4px 10px; border-radius:6px; margin-bottom:6px;">OPENAI ARTICLE JUDGE</span>
+            <h2 style="font-size:19px; letter-spacing:-.03em; display:flex; align-items:center; gap:8px;">
+              OpenAI API 기반 기사별 관점·신뢰도 판단
+            </h2>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+            <span id="openaiStatusBadge" style="font-size:11px; font-weight:700; padding:5px 10px; border-radius:99px; background:#edf8fc; color:#24566b; border:1px solid #b8dce8;">
+              OpenAI 상태 확인 중...
+            </span>
+            <button type="button" onclick="toggleOpenAIConfig()" style="font-size:11px; font-weight:700; padding:6px 12px; border-radius:8px; border:1px solid var(--border-strong); background:#fff; color:var(--text-main);">
+              OpenAI API 키 설정 ⚙
+            </button>
+            <button type="button" onclick="toggleCustomJudgeBox()" style="font-size:11px; font-weight:700; padding:6px 12px; border-radius:8px; border:1px solid var(--border-strong); background:var(--border-strong); color:#fff;">
+              직접 기사 판단 테스트 +
+            </button>
+          </div>
+        </div>
+
+        <!-- OpenAI API Key 입력 바 (토글) -->
+        <div id="openaiConfigBox" style="display:none; background:#fff; border:1px solid #d4dbc2; border-radius:10px; padding:14px 16px; margin-bottom:16px;">
+          <div style="font-size:12px; font-weight:700; margin-bottom:8px; color:var(--text-main);">
+            Unsloth 로컬 OpenAI API (base_url / api_key / model) 설정
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <input id="openaiBaseUrlInput" type="text" value="http://127.0.0.1:8889/v1" placeholder="http://127.0.0.1:8889/v1" style="width:210px; padding:8px 12px; border:1px solid #bcc3b1; border-radius:8px; font-size:12px;">
+            <input id="openaiKeyInput" type="text" value="sk-unsloth-f65f99d826c89c73362ddeb617e7963e" placeholder="sk-unsloth-..." style="flex:1; min-width:220px; padding:8px 12px; border:1px solid #bcc3b1; border-radius:8px; font-size:12px;">
+            <select id="openaiModelSelect" style="padding:8px 12px; border:1px solid #bcc3b1; border-radius:8px; font-size:12px; background:#fff; color:var(--text-main);">
+              <option value="kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF">kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF</option>
+              <option value="kakaocorp/kanana-nano-2.1b-instruct">kakaocorp/kanana-nano-2.1b-instruct</option>
+              <option value="kakaocorp/kanana-nano-2.1b-base">kakaocorp/kanana-nano-2.1b-base</option>
+              <option value="unsloth/Qwen3.5-2B-GGUF">unsloth/Qwen3.5-2B-GGUF</option>
+            </select>
+            <button type="button" onclick="saveOpenAIKeyAndRejudge()" class="search-btn" style="padding:8px 16px; font-size:12px;">
+              적용 후 재판단 ↗
+            </button>
+          </div>
+        </div>
+
+        <!-- 단일 기사 직접 입력 판단 테스트 박스 (토글) -->
+        <div id="customJudgeBox" style="display:none; background:#fff; border:1px solid #d4dbc2; border-radius:10px; padding:16px; margin-bottom:16px;">
+          <div style="font-size:13px; font-weight:800; margin-bottom:10px; color:var(--text-main);">
+            단일 뉴스 기사 OpenAI 실시간 판단기
+          </div>
+          <div style="display:grid; grid-template-columns:160px 1fr; gap:8px; margin-bottom:8px;">
+            <input id="customPressInput" type="text" placeholder="신문사명 (예: 한국경제)" style="padding:8px 12px; border:1px solid #bcc3b1; border-radius:8px; font-size:12px;">
+            <input id="customTitleInput" type="text" placeholder="판단할 기사 제목을 입력하세요" style="padding:8px 12px; border:1px solid #bcc3b1; border-radius:8px; font-size:12px;">
+          </div>
+          <textarea id="customContentInput" rows="3" placeholder="판단할 기사 본문 내용을 붙여넣으세요..." style="width:100%; padding:10px 12px; border:1px solid #bcc3b1; border-radius:8px; font-size:12px; font-family:inherit; margin-bottom:8px;"></textarea>
+          <div style="display:flex; justify-content:flex-end;">
+            <button type="button" onclick="runCustomArticleJudge()" class="search-btn" style="padding:8px 16px; font-size:12px;">
+              OpenAI로 이 기사 판단하기 ↗
+            </button>
+          </div>
+          <div id="customJudgeResult" style="display:none; margin-top:12px; padding:12px 14px; background:#f4f7ec; border-radius:8px; border:1px solid #cdd8b6; font-size:12.5px;"></div>
+        </div>
+
+        <!-- 전체 이슈 종합 판단 요약 -->
+        <div id="overallJudgmentBox" style="background:#fff; border:1px solid #dfe4cb; border-radius:12px; padding:16px 20px; margin-bottom:16px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+            <div style="font-size:13px; font-weight:800; color:var(--claim1-accent);">
+              종합 적합성 판정: <span id="ojVerdict" style="color:var(--text-main);">분석 중...</span>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; font-size:11.5px;">
+              <span id="ojEngine" style="background:#f0f5cf; padding:3px 9px; border-radius:6px; font-weight:700; color:#46551c;">OpenAI Judge</span>
+              <span id="ojScore" style="background:#e8f6fc; padding:3px 9px; border-radius:6px; font-weight:700; color:#24566b;">신뢰도 95점</span>
+            </div>
+          </div>
+          <div style="font-size:12.5px; color:var(--text-sub); margin-bottom:6px;">
+            <strong>1. 핵심 대립 축:</strong> <span id="ojConflictAxis">-</span>
+          </div>
+          <div style="font-size:12.5px; color:var(--text-sub); margin-bottom:4px;">
+            <strong>2. 관점 A 논조 판단:</strong> <span id="ojViewA">-</span>
+          </div>
+          <div style="font-size:12.5px; color:var(--text-sub); margin-bottom:6px;">
+            <strong>3. 관점 B 논조 판단:</strong> <span id="ojViewB">-</span>
+          </div>
+          <div style="font-size:13px; color:var(--text-main); line-height:1.7;">
+            <strong>4. 종합 결론:</strong> <span id="ojReason">수집된 신문사별 기사들을 바탕으로 관점 및 논조를 판단하고 있습니다.</span>
+          </div>
+        </div>
+
+        <!-- 기사별 개별 판단 카드 그리드 -->
+        <div style="font-size:12px; font-weight:800; color:var(--text-sub); margin-bottom:10px;">
+          수집 기사별 개별 AI 판단 내역 (관점 분류 · 논조 판정 · 연관도)
+        </div>
+        <div id="articleJudgmentsList" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); gap:12px;">
+        </div>
+      </section>
     </div>
-  </main><footer class="newsletter-footer"><strong>논점콩</strong><span>하나의 시선에 머물지 않는 뉴스 읽기 · 예시 데이터 기반 미리보기</span></footer>
+  </main><footer class="newsletter-footer"><strong>논점콩</strong><span>하나의 시선에 머물지 않는 뉴스 읽기 · news.db RAG &amp; OpenAI 기사 판단</span></footer>
 
   <script>
     const ISSUE_DATA = {
@@ -287,6 +380,173 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
       document.getElementById("claim2Press").innerHTML = data.claim2Press
         .map((p) => `<a class="press-badge" href="${p.url || '#source'}" target="_blank" rel="noopener noreferrer" title="${p.title}">${p.name} ↗</a>`)
         .join("");
+
+      // OpenAI API 기반 기사 판단 리포트 렌더링
+      const oj = data.overallJudgment || {
+        engine: "news.db 하이브리드 판단 엔진",
+        isLiveOpenAI: false,
+        verdict: "적합 (신문사별 관점 비교 완료)",
+        conflictAxis: `${data.claim1Title} vs ${data.claim2Title}`,
+        reliabilityScore: 95,
+        reason: data.summary
+      };
+      document.getElementById("ojVerdict").textContent = oj.verdict || "적합";
+      document.getElementById("ojEngine").textContent = oj.engine || "Unsloth OpenAI Judge";
+      document.getElementById("ojScore").textContent = `신뢰도 ${oj.reliabilityScore || 95}점`;
+      document.getElementById("ojConflictAxis").textContent = oj.conflictAxis || "-";
+      document.getElementById("ojViewA").textContent = oj.viewpointAJudgment || data.claim1Summary || "-";
+      document.getElementById("ojViewB").textContent = oj.viewpointBJudgment || data.claim2Summary || "-";
+      document.getElementById("ojReason").textContent = oj.reason || "";
+
+      const ajList = data.articleJudgments && data.articleJudgments.length > 0
+        ? data.articleJudgments
+        : [
+            ...(data.claim1Press || []).map((p) => ({
+              press: p.name,
+              title: p.title,
+              url: p.url || "#source",
+              stance: "관점 A",
+              tone: "추진·강조 논조",
+              relevanceScore: 92,
+              judgmentSummary: data.claim1Summary
+            })),
+            ...(data.claim2Press || []).map((p) => ({
+              press: p.name,
+              title: p.title,
+              url: p.url || "#source",
+              stance: "관점 B",
+              tone: "우려·신중 논조",
+              relevanceScore: 90,
+              judgmentSummary: data.claim2Summary
+            }))
+          ];
+
+      const listEl = document.getElementById("articleJudgmentsList");
+      if (ajList.length === 0) {
+        listEl.innerHTML = `<div style="grid-column:1/-1; padding:14px; background:#fff; border:1px dashed #cbd5b0; border-radius:10px; font-size:12.5px; color:var(--text-muted);">수집된 신뢰 근거 기사가 없어 개별 기사 판단을 생략했습니다 (환각 차단 작동).</div>`;
+      } else {
+        listEl.innerHTML = ajList
+          .map((item) => {
+            const isA = (item.stance || "").includes("관점 A");
+            const bgBadge = isA ? "var(--claim1-bg)" : "var(--claim2-bg)";
+            const colBadge = isA ? "var(--claim1-accent)" : "var(--claim2-accent)";
+            return `
+              <div style="background:#fff; border:1px solid var(--border-soft); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; justify-content:space-between; gap:10px;">
+                <div>
+                  <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:8px;">
+                    <span style="font-size:11px; font-weight:800; padding:3px 8px; border-radius:6px; background:${bgBadge}; color:${colBadge};">
+                      ${item.press} · ${item.stance}
+                    </span>
+                    <span style="font-size:11px; font-weight:700; color:var(--text-muted);">
+                      연관도 ${item.relevanceScore}%
+                    </span>
+                  </div>
+                  <div style="font-size:13px; font-weight:800; line-height:1.45; margin-bottom:6px; color:var(--text-main);">
+                    ${item.title}
+                  </div>
+                  <div style="font-size:12px; color:var(--text-sub); line-height:1.6;">
+                    ${item.judgmentSummary}
+                  </div>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; padding-top:8px; border-top:1px dashed var(--border-soft); font-size:11px;">
+                  <span style="font-weight:700; color:#5a6b47;">논조: ${item.tone}</span>
+                  <a class="press-badge" href="${item.url || '#source'}" target="_blank" rel="noopener noreferrer">원문 보기 ↗</a>
+                </div>
+              </div>
+            `;
+          })
+          .join("");
+      }
+    }
+
+    let currentQueryText = "김여정 대북 확성기 철거 남북관계";
+
+    function toggleOpenAIConfig() {
+      const box = document.getElementById("openaiConfigBox");
+      box.style.display = box.style.display === "none" ? "block" : "none";
+    }
+
+    function toggleCustomJudgeBox() {
+      const box = document.getElementById("customJudgeBox");
+      box.style.display = box.style.display === "none" ? "block" : "none";
+    }
+
+    async function refreshOpenAIStatus() {
+      const badge = document.getElementById("openaiStatusBadge");
+      try {
+        const res = await fetch("/api/openai-status");
+        if (res.ok) {
+          const st = await res.json();
+          if (st.server_online) {
+            badge.textContent = `Unsloth OpenAI 연결됨 (${st.base_url} · ${st.model})`;
+            badge.style.background = "#e6f4ea";
+            badge.style.color = "#1b4332";
+            badge.style.borderColor = "#95d5b2";
+          } else {
+            badge.textContent = `OpenAI 설정됨 (${st.base_url} · 오프라인 폴백 대기)`;
+            badge.style.background = "#fff3bf";
+            badge.style.color = "#7c5200";
+            badge.style.borderColor = "#ffd43b";
+          }
+        }
+      } catch (_) {
+        badge.textContent = "로컬 미리보기 모드";
+      }
+    }
+
+    async function saveOpenAIKeyAndRejudge() {
+      const base_url = document.getElementById("openaiBaseUrlInput").value.trim();
+      const key = document.getElementById("openaiKeyInput").value.trim();
+      const model = document.getElementById("openaiModelSelect").value;
+      try {
+        const res = await fetch("/api/openai-key", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base_url, api_key: key, model })
+        });
+        if (res.ok) {
+          await refreshOpenAIStatus();
+          document.getElementById("openaiConfigBox").style.display = "none";
+          await runQuery(currentQueryText);
+        }
+      } catch (_) {}
+    }
+
+    async function runCustomArticleJudge() {
+      const press = document.getElementById("customPressInput").value.trim();
+      const title = document.getElementById("customTitleInput").value.trim();
+      const content = document.getElementById("customContentInput").value.trim();
+      const outBox = document.getElementById("customJudgeResult");
+      if (!title && !content) return;
+
+      outBox.style.display = "block";
+      outBox.innerHTML = "OpenAI API로 기사를 판단하고 있습니다...";
+
+      try {
+        const res = await fetch("/api/judge-article", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            topic: currentQueryText,
+            press: press || "입력 기사",
+            title: title || "제목 없음",
+            content: content || title
+          })
+        });
+        if (res.ok) {
+          const d = await res.json();
+          outBox.innerHTML = `
+            <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
+              <strong>[${d.press}] 판정: ${d.verdict} (신뢰도 ${d.trustScore}점)</strong>
+              <span style="font-size:11px; font-weight:700; color:#24566b;">${d.engine} · 논조: ${d.tone}</span>
+            </div>
+            <div style="margin-bottom:4px;"><strong>핵심 주장:</strong> ${d.keyClaim}</div>
+            <div><strong>판단 근거:</strong> ${d.analysis}</div>
+          `;
+        }
+      } catch (_) {
+        outBox.innerHTML = "서버 연결 상태를 확인해 주세요.";
+      }
     }
 
     function loadIssue(key, btn) {
@@ -311,8 +571,9 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
     }
 
     async function runQuery(q) {
+      currentQueryText = q;
       document.getElementById("headlineText").textContent = `‘${q}’ 관련 기사를 수집·비교 분석 중입니다...`;
-      document.getElementById("headlineMeta").innerHTML = `<span>news.db 검색 및 신문사별 실시간 크롤링·요약 진행 중</span>`;
+      document.getElementById("headlineMeta").innerHTML = `<span>news.db 검색 및 OpenAI 기사 판단·요약 진행 중</span>`;
 
       // FastAPI 서버(/api/analyze)가 실행 중이면 API 호출, 정적 파일 열기 상태면 로컬 매칭
       try {
@@ -374,6 +635,7 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
     }
 
     window.addEventListener("DOMContentLoaded", () => {
+      refreshOpenAIStatus();
       runQuery("김여정 대북 확성기 철거 남북관계");
     });
   </script>

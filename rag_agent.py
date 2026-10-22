@@ -92,6 +92,16 @@ OID_TO_PRESS: dict[str, str] = {
     "243": "이코노미스트",
     "277": "아시아경제",
     "293": "블로터",
+    "076": "스포츠조선",
+    "094": "월간산",
+    "117": "마이데일리",
+    "145": "레이디경향",
+    "241": "일간스포츠",
+    "262": "신동아",
+    "296": "코메디닷컴",
+    "308": "시사IN",
+    "310": "여성신문",
+    "346": "헬스조선",
     "366": "조선비즈",
     "374": "SBS Biz",
     "417": "머니S",
@@ -100,6 +110,7 @@ OID_TO_PRESS: dict[str, str] = {
     "437": "JTBC",
     "448": "TV조선",
     "449": "채널A",
+    "468": "스포츠서울",
     "469": "한국일보",
     "584": "동아사이언스",
     "586": "시사저널",
@@ -126,7 +137,9 @@ STOPWORDS = {
     "비교", "비교해줘", "알려줘", "요약", "요약해줘", "입장", "관점", "신문사별",
     "언론사별", "최근", "오늘", "지금", "이슈", "논란", "분석", "반응", "생각",
     "무엇", "어떤", "에서", "으로", "하고", "있다", "밝혔다", "전했다", "말했다",
-    "의견", "해석", "헤드라인",
+    "의견", "해석", "헤드라인", "방금", "요약한", "내용", "그중", "이전", "질문",
+    "질문에서", "다룬", "위에서", "자세히", "신문사", "신문사들의", "언론사", "언론사들의",
+    "입장을", "의견을", "근거", "수치", "수치를", "핵심", "평가하는지", "대해서",
 }
 
 
@@ -383,6 +396,8 @@ class NewsDBRAG:
             if u not in candidate_urls:
                 candidate_urls.append(u)
 
+        q_keywords = extract_keywords(query)
+        min_required_kws = 1 if len(q_keywords) <= 1 else max(2, (len(q_keywords) + 1) // 2)
         saved_count = 0
         with sqlite3.connect(self.db_path) as con:
             cur = con.cursor()
@@ -400,6 +415,11 @@ class NewsDBRAG:
 
                 title, body = parse_naver_article_html(art_resp.text)
                 if not title or len(body) < 140 or title.startswith("[포토]"):
+                    continue
+
+                matched_kws = sum(1 for kw in q_keywords if kw in title or kw in body)
+                has_subject = any(kw in title or kw in body for kw in q_keywords[:2]) if q_keywords else True
+                if q_keywords and (matched_kws < min_required_kws or not has_subject):
                     continue
 
                 # 1. LINK 테이블 저장
@@ -488,9 +508,14 @@ class NewsDBRAG:
                 kw_score = min(1.0, matched / (len(q_keywords) * 1.5))
 
             min_required_kws = 1 if len(q_keywords) <= 1 else max(2, (len(q_keywords) + 1) // 2)
+            has_subject_kw = (
+                any(kw in title or kw in content or kw in kw_str for kw in q_keywords[:2])
+                if q_keywords
+                else True
+            )
             hybrid_score = 0.45 * max(0.0, vec_sim) + 0.55 * kw_score
 
-            if hybrid_score >= min_score and matched_kw_count >= min_required_kws:
+            if hybrid_score >= min_score and matched_kw_count >= min_required_kws and has_subject_kw:
                 scored.append(
                     RetrievedArticle(
                         news_pk=pk,
@@ -771,11 +796,12 @@ class NewsLensAgent:
     def retrieve_news_node(self, state: AgentState) -> AgentState:
         """news.db에서 하이브리드 RAG 검색을 수행합니다."""
         search_text = " ".join(state.get("keywords") or []) or state.get("query", "")
-        articles = self.rag.retrieve(search_text, top_k=8, min_score=0.14, diversify_press=True)
+        articles = self.rag.retrieve(search_text, top_k=8, min_score=0.28, diversify_press=True)
         distinct_press = {a.press for a in articles}
+        top_score = articles[0].score if articles else 0.0
         return {
             "articles": [a.model_dump() for a in articles],
-            "is_sufficient": len(articles) >= 2 and len(distinct_press) >= 2,
+            "is_sufficient": len(articles) >= 2 and len(distinct_press) >= 2 and top_score >= 0.35,
         }
 
     def decide_crawl_or_compare(self, state: AgentState) -> Literal["compare", "crawl"]:
@@ -798,11 +824,13 @@ class NewsLensAgent:
         """
         search_text = " ".join(state.get("keywords") or []) or state.get("query", "")
         added = self.rag.crawl_topic_and_save_to_db(search_text, max_articles=8)
-        articles = self.rag.retrieve(search_text, top_k=8, min_score=0.14, diversify_press=True)
+        articles = self.rag.retrieve(search_text, top_k=8, min_score=0.28, diversify_press=True)
+        distinct_press = {a.press for a in articles}
+        top_score = articles[0].score if articles else 0.0
         return {
             "crawled_count": added,
             "articles": [a.model_dump() for a in articles],
-            "is_sufficient": len(articles) >= 2,
+            "is_sufficient": len(articles) >= 2 and len(distinct_press) >= 2 and top_score >= 0.35,
         }
 
     def route_after_crawl(self, state: AgentState) -> Literal["sufficient", "insufficient"]:
@@ -838,6 +866,7 @@ class NewsLensAgent:
                 "claim2Summary": "비교 가능한 신문사 기사가 부족하여 관점 B 요약을 생성하지 않았습니다.",
                 "claim2Points": ["news.db 내 일치 기사 부족"],
                 "claim2Press": [],
+                "articles": [],
             }
         }
 
@@ -921,6 +950,7 @@ class NewsLensAgent:
                     )
             result[key] = verified_list
 
+        result["articles"] = raw_articles
         thread_id = state.get("thread_id") or "default-session"
         history = self._memory_store.setdefault(thread_id, [])
         history.append({"query": state.get("query", ""), "headline": result.get("headline", "")})
