@@ -1,16 +1,9 @@
 """
-rag_agent.py - A2 문제 정의 기반:
-'하나의 주제에 대한 기사들을 긁어와 데이터베이스(news.db)에 저장해
- 관련된 내용을 하나의 헤드라인으로 묶어 요약해주되 신문사별로 의견을 비교해 주는'
-LangGraph + SQLite(news.db) 하이브리드 RAG AI 에이전트
-
-에이전트 단계 (판단 · 도구 선택 · 여러 단계):
-1. analyze_query_node       : 사용자 주제/질문에서 핵심 검색 키워드 추출 및 대화 맥락 결합
-2. retrieve_news_node       : news.db (NEWS + LINK + RAG_INDEX)에서 신문사별 관련 기사 하이브리드 검색
-3. decide_crawl_or_compare  : [에이전트 판단] DB 내 비교 가능한 신문사가 3곳 미만이면 크롤링 도구 선택
-4. crawl_topic_to_db_node   : [도구 실행] httpx로 주제 관련 여러 신문사 기사를 긁어와 news.db(LINK, NEWS, RAG_INDEX)에 저장 후 재검색
-5. compare_and_summarize    : 관련 기사를 하나의 통합 헤드라인으로 묶어 공통 팩트를 요약하고, 신문사별 해석·의견(관점 A vs 관점 B) 비교
-6. verify_sources_node      : 모든 신문사 출처·URL이 실제 news.db 저장 기사와 일치하는지 검증 (환각 차단)
+rag_agent.py - A2 문제 정의 + sqlite-vec (title_vec) 고속 벡터 색인 & 뉴스 자동 분류 AI 에이전트:
+1. NEWS.CLEAN_TITLE 전처리 및 NEWS.title_vec (float32[512]) 벡터화
+2. sqlite-vec 확장(VEC_NEWS_TITLE vec0 가상 테이블 & vec_distance_cosine)을 통한 초고속 색인·검색
+3. title_vec 기반 뉴스 자동 분류 시스템 (6대 뉴스 카테고리 분류 + KMeans 이슈 클러스터 분류 + 관점 A/B 분류)
+4. LangGraph 기반 신문사별 관점 비교·통합 헤드라인 요약 및 출처 검증
 """
 
 from __future__ import annotations
@@ -22,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 from typing import Any, Literal, TypedDict
 from urllib.parse import quote_plus
 
@@ -29,11 +23,13 @@ from dotenv import load_dotenv
 import httpx
 import numpy as np
 from pydantic import BaseModel, Field
+import sqlite_vec
 
 load_dotenv()
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = ROOT_DIR / "news.db"
+TITLE_VEC_DIM = 512
 
 HTTP_HEADERS = {
     "User-Agent": (
@@ -140,7 +136,183 @@ STOPWORDS = {
     "의견", "해석", "헤드라인", "방금", "요약한", "내용", "그중", "이전", "질문",
     "질문에서", "다룬", "위에서", "자세히", "신문사", "신문사들의", "언론사", "언론사들의",
     "입장을", "의견을", "근거", "수치", "수치를", "핵심", "평가하는지", "대해서",
+    "종합", "사진", "영상", "일문일답", "전문", "사설", "칼럼", "단신", "브리핑",
+    "초점", "현장", "르포", "인터뷰", "기획", "연재", "긴급", "주목", "화제", "해설",
+    "만에", "하루", "연중", "내내", "이후", "부터", "까지", "위해", "통해", "따라",
+    "이번", "지난", "내일", "어제", "올해", "내년", "작년", "현재", "당시",
+    "우리", "저희", "그것", "이것", "저것", "여기", "거기", "저기", "모두", "전체", "일부", "각각",
+    "있는", "없는", "하는", "되는", "않는", "같은", "위한", "통한", "따른", "대비", "두고", "놓고",
+    "있어", "없어", "하며", "되며", "되고", "한다", "된다", "했다", "됐다", "할까", "될까",
 }
+
+# preprocessing.ipynb 기반 의미 복원 한자 변환 규칙
+CONTEXTUAL_HANJA_PATTERNS: list[tuple[str, str]] = [
+    (r"李\s*대통령", "이재명 대통령 "),
+    (r"李\s*대표", "이재명 대표 "),
+    (r"尹\s*대통령", "윤석열 대통령 "),
+    (r"尹\s*전\s*대통령", "윤석열 전 대통령 "),
+    (r"文\s*전\s*대통령", "문재인 전 대통령 "),
+    (r"文\s*대통령", "문재인 대통령 "),
+    (r"韓\s*대표", "한동훈 대표 "),
+    (r"韓\s*위원장", "한동훈 위원장 "),
+    (r"吳\s*시장", "오세훈 시장 "),
+    (r"洪\s*시장", "홍준표 시장 "),
+    (r"曺\s*대표", "조국 대표 "),
+    (r"安\s*의원", "안철수 의원 "),
+    (r"與\s*野|與·野", "여당 야당 "),
+    (r"黨\s*政\s*大|당\s*정\s*대", "당정대 "),
+    (r"黨\s*政|黨·政", "당정 "),
+    (r"行\s*安\s*부|행\s*안\s*부", "행정안전부 "),
+    (r"韓\s*국", "한국"),
+    (r"韓·美·日|韓美日", "한국 미국 일본 "),
+    (r"韓·中·日|韓中日", "한국 중국 일본 "),
+    (r"韓·美|韓美|한·美|韓·미", "한국 미국 "),
+    (r"韓·日|韓日|한·日|韓·일", "한국 일본 "),
+    (r"韓·中|韓中|한·中|韓·중", "한국 중국 "),
+    (r"韓·露|韓露|한·露|韓·러", "한국 러시아 "),
+    (r"美·北|美北|北·美|北美", "미국 북한 "),
+    (r"美·中|美中|中·美|中美", "미국 중국 "),
+    (r"美·日|美日|日·美|日美", "미국 일본 "),
+    (r"北·中|北中|中·北|中北", "북한 중국 "),
+    (r"北·露|北露|露·北|露北", "북한 러시아 "),
+    (r"방韓|訪韓", "방한"),
+    (r"내韓|來韓", "내한"),
+    (r"주韓|駐韓", "주한"),
+    (r"반韓|反韓", "반한"),
+    (r"친韓|親韓", "친한"),
+    (r"혐韓|嫌韓", "혐한"),
+    (r"주한\s*美\s*군", "주한 미군 "),
+    (r"(?<=[방내주반친혐대訪來駐反親嫌對])美", "미"),
+    (r"(?<=[방내주반친혐대訪來駐反親嫌對])中", "중"),
+    (r"(?<=[방내주반친혐대訪來駐反親嫌對])日", "일"),
+    (r"(?<=[방내주반친혐대訪來駐反親嫌對])北", "북"),
+    (r"(?<=[방내주반친혐대訪來駐反親嫌對])露", "러"),
+]
+
+SEMANTIC_HANJA_DICT: dict[str, str] = {
+    "李": "이재명 ", "尹": "윤석열 ", "韓": "한동훈 ", "文": "문재인 ",
+    "洪": "홍준표 ", "吳": "오세훈 ", "安": "안철수 ", "曺": "조국 ",
+    "美": "미국 ", "北": "북한 ", "中": "중국 ", "日": "일본 ", "露": "러시아 ",
+    "英": "영국 ", "佛": "프랑스 ", "獨": "독일 ", "臺": "대만 ",
+    "與": "여당 ", "野": "야당 ", "政": "정부 ", "檢": "검찰 ", "警": "경찰 ",
+    "軍": "군대 ", "靑": "청와대 ", "法": "법원 ", "銀": "은행 ", "證": "증권 ",
+    "企": "기업 ", "黨": "정당 ",
+}
+
+PHONETIC_HANJA_TRANS = str.maketrans({
+    "萬": "만", "億": "억", "兆": "조",
+    "年": "년", "月": "월", "時": "시", "分": "분", "秒": "초",
+    "大": "대", "小": "소", "新": "신", "舊": "구", "高": "고", "低": "저", "多": "다", "少": "소",
+    "前": "전", "後": "후", "上": "상", "下": "하", "內": "내", "外": "외", "左": "좌", "右": "우",
+    "正": "정", "副": "부", "親": "친", "反": "반", "非": "비", "汎": "범", "全": "전",
+    "對": "대", "發": "발", "行": "행", "故": "고", "無": "무", "有": "유", "重": "중", "輕": "경",
+    "株": "주", "債": "채", "稅": "세", "金": "금", "院": "원", "朴": "박",
+})
+
+# title_vec 기반 6대 뉴스 분류 카테고리 정의 (대표 시드 어휘 및 설명)
+NEWS_CATEGORY_SPECS: dict[str, dict[str, str]] = {
+    "정치·국정": {
+        "icon": "🏛️",
+        "desc": "대통령실·국회·정당·국무회의·선거 및 국정 현안",
+        "seed": (
+            "대통령 이재명 윤석열 국회 여당 야당 더불어민주당 국민의힘 조국혁신당 대표 최고위원 "
+            "원내대표 국무회의 총리 김민석 장동혁 한동훈 조국 법사위 본회의 특검 탄핵 정국 지지율 정당"
+        ),
+    },
+    "경제·금융·산업": {
+        "icon": "📈",
+        "desc": "금리·환율·증시·부동산·연금·물가·기업 실적 및 재정",
+        "seed": (
+            "한국은행 기준금리 금리 동결 인하 환율 달러 물가 코스피 코스닥 증시 외국인 순매수 주식 "
+            "국민연금 전업주부 가계부채 스트레스 DSR 부동산 대출 아파트 은행 금융 수출 무역 추경 예산 관세 유가"
+        ),
+    },
+    "사회·사법·의료": {
+        "icon": "⚖️",
+        "desc": "검찰·경찰·법원·사법개혁·의대증원·노동·교육 및 사건사고",
+        "seed": (
+            "검찰 경찰 법원 수사기관장 배석 사법개혁 검찰개혁 조희대 대법원 재판 구속 수사 기소 "
+            "의대 증원 의료개혁 전공의 병원 의사 환자 교육 대학 노조 파업 사건 사고 범죄 화재 안전"
+        ),
+    },
+    "외교·안보·국제": {
+        "icon": "🌐",
+        "desc": "남북관계·주한미군·한미동맹·중동·미중갈등 및 국제 정세",
+        "seed": (
+            "북한 김여정 확성기 대남 대북 남북관계 국경선 주한미군 한미연합훈련 미8군 사령관 국방 안보 군대 "
+            "미국 트럼프 중국 일본 러시아 중동 이란 이스라엘 호르무즈 해협 전쟁 유엔 외교 정상회담"
+        ),
+    },
+    "IT·과학·반도체": {
+        "icon": "🔬",
+        "desc": "AI·반도체·D램·빅테크·원전·우주항공 및 첨단 과학기술",
+        "seed": (
+            "AI 인공지능 반도체 D램 HBM 메모리 파운드리 삼성전자 SK하이닉스 엔비디아 목표주가 빅테크 "
+            "클라우드 로봇 자율주행 원전 원자력 재생에너지 배터리 전기차 우주 누리호 과학 기술 디지털 통신"
+        ),
+    },
+    "생활·문화·스포츠": {
+        "icon": "🎭",
+        "desc": "날씨·건강·관광·문화예술·연예·방송 및 스포츠",
+        "seed": (
+            "날씨 기온 미세먼지 비 폭염 한파 건강 운동 음식 여행 관광 축제 공연 영화 드라마 연예 "
+            "가수 배우 방송 스포츠 축구 야구 프로야구 올림픽 선수 감독 우승 경기"
+        ),
+    },
+}
+
+
+def connect_vec_db(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """SQLite 연결을 생성하고 가상환경에 설치된 sqlite-vec 확장을 로드합니다."""
+    con = sqlite3.connect(str(db_path))
+    con.enable_load_extension(True)
+    sqlite_vec.load(con)
+    con.enable_load_extension(False)
+    return con
+
+
+def preprocess_title(text: str) -> str:
+    """
+    preprocessing.ipynb 규칙과 동일하게 뉴스 제목의 한자어를 의미 복원하고
+    상투어 태그·특수문자·조사·불용어를 정제하여 CLEAN_TITLE을 반환합니다.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    tag_pattern = (
+        r"[\[\(\<【]\s*(?:종합|단독|속보|포토|사진|영상|일문일답|전문|사설|칼럼|브리핑|"
+        r"현장|르포|인터뷰|기획|긴급|뉴스|그래픽|카드뉴스|팩트체크|이슈)[0-9보\s]*[\]\)\>】]"
+    )
+    text = re.sub(tag_pattern, " ", text)
+    text = re.sub(r"(\d+)\s*日", r"\1일", text)
+
+    for pattern, replacement in CONTEXTUAL_HANJA_PATTERNS:
+        text = re.sub(pattern, replacement, text)
+
+    for hanja, full_word in SEMANTIC_HANJA_DICT.items():
+        text = re.sub(hanja + r"(?=[은는이가을를의에로과와도만]\b)", full_word.strip(), text)
+        text = text.replace(hanja, full_word)
+
+    text = text.translate(PHONETIC_HANJA_TRANS)
+    text = re.sub(r"[^가-힣a-zA-Z0-9\s]", " ", text)
+
+    words = text.split()
+    cleaned_words: list[str] = []
+    for w in words:
+        if w in STOPWORDS:
+            continue
+        if len(w) >= 3:
+            w_stem = re.sub(
+                r"(에서|으로|에게|부터|까지|이랑|라는|에는|이라|라고|은|는|이|가|을|를|의|에|로|과|와|도|만)$",
+                "",
+                w,
+            )
+            if len(w_stem) >= 2:
+                w = w_stem
+        if w not in STOPWORDS and len(w) >= 2:
+            cleaned_words.append(w)
+
+    return " ".join(cleaned_words)
 
 
 def mask_sensitive_info(text: str) -> str:
@@ -169,12 +341,17 @@ def extract_press_name(url: str, content: str) -> str:
 
 def extract_keywords(text: str) -> list[str]:
     """한국어 조사 어미를 제거하고 핵심 검색 키워드를 추출합니다."""
-    raw_tokens = TOKEN_RE.findall(text)
+    cleaned_title = preprocess_title(text)
+    raw_tokens = TOKEN_RE.findall(f"{cleaned_title} {text}")
     keywords: list[str] = []
     for tok in raw_tokens:
         if tok in STOPWORDS:
             continue
-        cleaned = re.sub(r"(에서|으로|에게|부터|까지|이랑|라는|에는|은|는|이|가|을|를|에|의|로|과|와|도|만)$", "", tok)
+        cleaned = re.sub(
+            r"(에서|으로|에게|부터|까지|이랑|라는|에는|은|는|이|가|을|를|에|의|로|과|와|도|만)$",
+            "",
+            tok,
+        )
         if len(cleaned) >= 2 and cleaned not in STOPWORDS:
             keywords.append(cleaned)
         elif len(tok) >= 2 and tok not in STOPWORDS:
@@ -189,16 +366,20 @@ def extract_keywords(text: str) -> list[str]:
     return unique
 
 
-def text_to_vector(text: str, dim: int = 512) -> np.ndarray:
-    """단어 + 음절 바이그램/트라이그램 Feature Hashing 기반 L2 정규화 임베딩 벡터를 생성합니다."""
+def text_to_vector(text: str, dim: int = TITLE_VEC_DIM) -> np.ndarray:
+    """
+    CLEAN_TITLE 또는 검색 질의를 단어 + 음절 바이그램/트라이그램 Feature Hashing 기반
+    L2 정규화 float32 임베딩 벡터(dim=512)로 고속 변환합니다.
+    """
     vec = np.zeros(dim, dtype=np.float32)
-    tokens = extract_keywords(text)
+    clean = preprocess_title(text) or text
+    tokens = TOKEN_RE.findall(clean)
     if not tokens:
         tokens = TOKEN_RE.findall(text)
 
     features: list[tuple[str, float]] = []
     for tok in tokens:
-        features.append((f"w:{tok}", 2.0))
+        features.append((f"w:{tok}", 2.2))
         for n in (2, 3):
             if len(tok) >= n:
                 for i in range(len(tok) - n + 1):
@@ -214,6 +395,11 @@ def text_to_vector(text: str, dim: int = 512) -> np.ndarray:
     if norm > 0:
         vec /= norm
     return vec
+
+
+def serialize_vec(vec: np.ndarray) -> bytes:
+    """numpy float32 배열을 sqlite-vec 호환 직렬화 BLOB으로 변환합니다."""
+    return sqlite_vec.serialize_float32(vec.astype(np.float32).tolist())
 
 
 def parse_naver_article_html(raw_html: str) -> tuple[str, str]:
@@ -244,10 +430,15 @@ class RetrievedArticle(BaseModel):
     news_pk: int
     press: str
     title: str
+    clean_title: str = ""
+    category: str = "시사·종합"
+    cluster_label: str = ""
     content: str
+    summary: str = ""
     url: str
     regdate: str
     score: float
+    title_vec_sim: float = 0.0
 
 
 class PressItemSchema(BaseModel):
@@ -271,22 +462,75 @@ class ComparisonOutputSchema(BaseModel):
 
 
 class NewsDBRAG:
-    """news.db (SQLite) 기반 하이브리드 RAG 인덱서, 검색기 및 실시간 주제 크롤러"""
+    """
+    news.db (SQLite + sqlite-vec 확장) 기반:
+    - NEWS.CLEAN_TITLE -> NEWS.title_vec 벡터화 및 VEC_NEWS_TITLE(vec0) 고속 색인
+    - title_vec 기반 6대 뉴스 카테고리 분류 & KMeans(k=20) 이슈 클러스터 분류
+    - 하이브리드 RAG 검색 및 실시간 주제 크롤러
+    """
 
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH, embedding_dim: int = 512) -> None:
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH, embedding_dim: int = TITLE_VEC_DIM) -> None:
         self.db_path = Path(db_path)
         self.embedding_dim = embedding_dim
+        self.category_vectors: dict[str, np.ndarray] = {
+            cat: text_to_vector(spec["seed"], dim=self.embedding_dim)
+            for cat, spec in NEWS_CATEGORY_SPECS.items()
+        }
+        self.cluster_centroids: dict[int, tuple[str, np.ndarray]] = {}
+        self.last_index_elapsed_ms: float = 0.0
+        self.sqlite_vec_version: str = "v0.1.9"
         self.ensure_rag_index()
 
+    def _classify_category_from_vec(self, clean_title: str, vec: np.ndarray) -> tuple[str, dict[str, float]]:
+        """title_vec 코사인 유사도 및 도메인 핵심어 매칭으로 6대 뉴스 카테고리를 정밀 분류합니다."""
+        scores: dict[str, float] = {}
+        title_text = clean_title or ""
+        for cat, cat_vec in self.category_vectors.items():
+            sim = max(0.0, float(np.dot(vec, cat_vec)))
+            seed_tokens = NEWS_CATEGORY_SPECS[cat]["seed"].split()
+            overlap_hits = sum(1 for tok in seed_tokens if len(tok) >= 2 and tok in title_text)
+            scores[cat] = round(sim * 0.55 + min(0.65, overlap_hits * 0.18), 4)
+
+        best_cat = max(scores.items(), key=lambda x: x[1])[0]
+        if scores[best_cat] < 0.04:
+            best_cat = "사회·사법·의료"
+        return best_cat, scores
+
     def ensure_rag_index(self, force_rebuild: bool = False) -> int:
-        """news.db 내에 RAG_INDEX 테이블을 생성하고 NEWS+LINK 데이터를 정제·임베딩하여 적재합니다."""
+        """
+        1) NEWS 테이블에 CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL 칼럼을 생성·업데이트하고
+        2) sqlite-vec의 vec0 가상 테이블(VEC_NEWS_TITLE) 및 RAG_INDEX를 고속 구축합니다.
+        """
         if not self.db_path.exists():
             raise FileNotFoundError(f"데이터베이스 파일을 찾을 수 없습니다: {self.db_path}")
 
-        with sqlite3.connect(self.db_path) as con:
+        t0 = time.perf_counter()
+        with connect_vec_db(self.db_path) as con:
             cur = con.cursor()
+            self.sqlite_vec_version = cur.execute("SELECT vec_version()").fetchone()[0]
+
+            # 1. NEWS 테이블에 CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL, SUMMARY 칼럼 보장
+            news_cols = {c[1] for c in cur.execute("PRAGMA table_info(NEWS)").fetchall()}
+            if "CLEAN_TITLE" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN CLEAN_TITLE TEXT")
+            if "title_vec" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN title_vec BLOB")
+            if "CATEGORY" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN CATEGORY TEXT")
+            if "CLUSTER_ID" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN CLUSTER_ID INTEGER DEFAULT 0")
+            if "CLUSTER_LABEL" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN CLUSTER_LABEL TEXT DEFAULT ''")
+            if "SUMMARY" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN SUMMARY TEXT DEFAULT ''")
+            if "SUMMARY_MODEL" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN SUMMARY_MODEL TEXT DEFAULT ''")
+            if "SUMMARY_AT" not in news_cols:
+                cur.execute("ALTER TABLE NEWS ADD COLUMN SUMMARY_AT TEXT DEFAULT ''")
+
             if force_rebuild:
                 cur.execute("DROP TABLE IF EXISTS RAG_INDEX")
+                cur.execute("DROP TABLE IF EXISTS VEC_NEWS_TITLE")
 
             cur.execute(
                 """
@@ -295,54 +539,139 @@ class NewsDBRAG:
                     PRESS TEXT NOT NULL,
                     URL TEXT NOT NULL,
                     TITLE TEXT NOT NULL,
+                    CLEAN_TITLE TEXT NOT NULL DEFAULT '',
+                    CATEGORY TEXT NOT NULL DEFAULT '시사·종합',
+                    CLUSTER_ID INTEGER NOT NULL DEFAULT 0,
+                    CLUSTER_LABEL TEXT NOT NULL DEFAULT '',
                     CLEAN_CONTENT TEXT NOT NULL,
+                    SUMMARY TEXT NOT NULL DEFAULT '',
                     KEYWORDS TEXT NOT NULL,
                     EMBEDDING BLOB NOT NULL,
+                    title_vec BLOB,
                     REGDATE TEXT
                 )
                 """
             )
+            rag_cols = {c[1] for c in cur.execute("PRAGMA table_info(RAG_INDEX)").fetchall()}
+            for col_name, col_def in [
+                ("CLEAN_TITLE", "TEXT NOT NULL DEFAULT ''"),
+                ("CATEGORY", "TEXT NOT NULL DEFAULT '시사·종합'"),
+                ("CLUSTER_ID", "INTEGER NOT NULL DEFAULT 0"),
+                ("CLUSTER_LABEL", "TEXT NOT NULL DEFAULT ''"),
+                ("SUMMARY", "TEXT NOT NULL DEFAULT ''"),
+                ("title_vec", "BLOB"),
+            ]:
+                if col_name not in rag_cols:
+                    cur.execute(f"ALTER TABLE RAG_INDEX ADD COLUMN {col_name} {col_def}")
 
-            indexed_count = cur.execute("SELECT COUNT(*) FROM RAG_INDEX").fetchone()[0]
-            total_news = cur.execute("SELECT COUNT(*) FROM NEWS").fetchone()[0]
-            if indexed_count > 0 and not force_rebuild and indexed_count >= int(total_news * 0.5):
-                return indexed_count
+            # sqlite-vec 가상 테이블(vec0) 생성: clean_title을 벡터화한 title_vec 코사인 거리 인덱스
+            cur.execute(
+                f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS VEC_NEWS_TITLE USING vec0(
+                    news_pk INTEGER PRIMARY KEY,
+                    title_vec float[{self.embedding_dim}] distance_metric=cosine
+                )
+                """
+            )
 
+            # 이미 모든 NEWS 행에 title_vec과 CLUSTER_LABEL이 채워져 있고 VEC_NEWS_TITLE이 준비된 경우 빠른 패스
+            missing_vec_cnt = cur.execute(
+                "SELECT COUNT(*) FROM NEWS WHERE title_vec IS NULL OR CATEGORY IS NULL OR CLUSTER_LABEL IS NULL OR CLUSTER_LABEL = ''"
+            ).fetchone()[0]
+            vec_table_cnt = cur.execute("SELECT COUNT(*) FROM VEC_NEWS_TITLE").fetchone()[0]
+            rag_missing_vec = cur.execute(
+                "SELECT COUNT(*) FROM RAG_INDEX WHERE title_vec IS NULL OR CLEAN_TITLE = ''"
+            ).fetchone()[0]
+
+            if not force_rebuild and missing_vec_cnt == 0 and vec_table_cnt > 0 and rag_missing_vec == 0:
+                self._load_cluster_centroids_from_db(cur)
+                self.last_index_elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+                return vec_table_cnt
+
+            # 2. 전체 NEWS 로드 후 CLEAN_TITLE 기반으로 title_vec 고속 벡터화 (긴 본문 대신 CLEAN_TITLE만 벡터화하여 색인 속도 대폭 향상)
             rows = cur.execute(
                 """
-                SELECT N.PK, COALESCE(L.URL, ''), N.TITLE, N.CONTENT, COALESCE(N.REGDATE, '')
+                SELECT N.PK, COALESCE(L.URL, ''), N.TITLE, COALESCE(N.CLEAN_TITLE, ''), N.CONTENT, COALESCE(N.REGDATE, '')
                 FROM NEWS N
                 LEFT JOIN LINK L ON N.FK = L.PK
                 ORDER BY N.PK ASC
                 """
             ).fetchall()
 
+            pks: list[int] = []
+            clean_titles: list[str] = []
+            vecs_list: list[np.ndarray] = []
+            vec_blobs: list[bytes] = []
+            categories: list[str] = []
+
+            for pk, _url, raw_title, db_clean_title, _content, _regdate in rows:
+                c_title = db_clean_title.strip() if db_clean_title and db_clean_title.strip() else preprocess_title(raw_title or "")
+                if not c_title:
+                    c_title = re.sub(r"\s+", " ", (raw_title or "")).strip()
+                t_vec = text_to_vector(c_title, dim=self.embedding_dim)
+                t_blob = serialize_vec(t_vec)
+                cat, _ = self._classify_category_from_vec(c_title, t_vec)
+
+                pks.append(pk)
+                clean_titles.append(c_title)
+                vecs_list.append(t_vec)
+                vec_blobs.append(t_blob)
+                categories.append(cat)
+
+            # 3. preprocessing.ipynb의 기준 C (실루엣 k=88과 엘보우 k=20의 평균 k=54) 방식으로 CLEAN_TITLE / title_vec 기반 이슈 클러스터 분류
+            cluster_ids, cluster_labels = self._compute_issue_clusters(clean_titles, vecs_list, n_clusters=54)
+
+            # 4. NEWS 테이블에 CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL 일괄 업데이트
+            news_updates = [
+                (clean_titles[i], vec_blobs[i], categories[i], int(cluster_ids[i]), cluster_labels[i], pks[i])
+                for i in range(len(pks))
+            ]
+            cur.executemany(
+                """
+                UPDATE NEWS
+                SET CLEAN_TITLE = ?, title_vec = ?, CATEGORY = ?, CLUSTER_ID = ?, CLUSTER_LABEL = ?
+                WHERE PK = ?
+                """,
+                news_updates,
+            )
+
+            # 5. sqlite-vec 가상 테이블(VEC_NEWS_TITLE) 일괄 색인
+            cur.execute("DELETE FROM VEC_NEWS_TITLE")
+            cur.executemany(
+                "INSERT INTO VEC_NEWS_TITLE(news_pk, title_vec) VALUES (?, ?)",
+                [(pks[i], vec_blobs[i]) for i in range(len(pks))],
+            )
+
+            # 6. RAG_INDEX 테이블 동기화 (EMBEDDING에도 고속 생성된 title_vec + 핵심 요약 벡터 저장)
             seen_titles: set[str] = set()
-            to_insert: list[tuple[Any, ...]] = []
-
-            for pk, url, title, content, regdate in rows:
-                clean_title = re.sub(r"\s+", " ", (title or "")).strip()
+            rag_to_insert: list[tuple[Any, ...]] = []
+            for idx, (pk, url, raw_title, _db_clean, content, regdate) in enumerate(rows):
+                norm_title = re.sub(r"\s+", " ", (raw_title or "")).strip()
                 clean_body = mask_sensitive_info(content or "")
-
-                if len(clean_body) < 120 or clean_title.startswith("[포토]"):
+                if len(clean_body) < 120 or norm_title.startswith("[포토]"):
                     continue
-                if clean_title in seen_titles:
+                if norm_title in seen_titles:
                     continue
-                seen_titles.add(clean_title)
+                seen_titles.add(norm_title)
 
                 press = extract_press_name(url, content)
-                kw_list = extract_keywords(f"{clean_title} {clean_title} {clean_body[:600]}")
-                emb = text_to_vector(f"{clean_title} {clean_title} {clean_body[:800]}", dim=self.embedding_dim)
+                c_title = clean_titles[idx]
+                kw_list = extract_keywords(f"{c_title} {c_title} {clean_body[:400]}")
 
-                to_insert.append(
+                rag_to_insert.append(
                     (
                         pk,
                         press,
                         url,
-                        clean_title,
+                        norm_title,
+                        c_title,
+                        categories[idx],
+                        int(cluster_ids[idx]),
+                        cluster_labels[idx],
                         clean_body,
                         " ".join(kw_list[:60]),
-                        emb.tobytes(),
+                        vec_blobs[idx],
+                        vec_blobs[idx],
                         regdate,
                     )
                 )
@@ -350,19 +679,98 @@ class NewsDBRAG:
             cur.executemany(
                 """
                 INSERT OR REPLACE INTO RAG_INDEX
-                (NEWS_PK, PRESS, URL, TITLE, CLEAN_CONTENT, KEYWORDS, EMBEDDING, REGDATE)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (NEWS_PK, PRESS, URL, TITLE, CLEAN_TITLE, CATEGORY, CLUSTER_ID, CLUSTER_LABEL,
+                 CLEAN_CONTENT, KEYWORDS, EMBEDDING, title_vec, REGDATE)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                to_insert,
+                rag_to_insert,
             )
             con.commit()
-            return len(to_insert)
+            self._load_cluster_centroids_from_db(cur)
+
+        self.last_index_elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return len(pks)
+
+    def _compute_issue_clusters(
+        self,
+        clean_titles: list[str],
+        vecs_list: list[np.ndarray],
+        n_clusters: int = 20,
+    ) -> tuple[list[int], list[str]]:
+        """
+        CLEAN_TITLE 및 title_vec을 기반으로 뉴스 기사들을 k개 이슈 클러스터로 자동 분류하고
+        각 클러스터의 대표 키워드 3개로 라벨(예: 'C3: 대통령, 이재명, 국무회의')을 부여합니다.
+        """
+        if not clean_titles:
+            return [], []
+
+        k = min(n_clusters, max(2, len(clean_titles) // 5))
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.feature_extraction.text import TfidfVectorizer
+
+            vectorizer = TfidfVectorizer(
+                token_pattern=r"(?u)\b[가-힣a-zA-Z][가-힣a-zA-Z0-9]+\b",
+                max_features=3000,
+            )
+            X_tfidf = vectorizer.fit_transform(clean_titles)
+            feature_names = vectorizer.get_feature_names_out()
+
+            km = KMeans(n_clusters=k, random_state=42, n_init=10)
+            c_ids = km.fit_predict(X_tfidf).tolist()
+
+            label_map: dict[int, str] = {}
+            for i in range(k):
+                center = km.cluster_centers_[i]
+                top_idx = center.argsort()[::-1][:3]
+                max_weight = float(center[top_idx[0]]) if len(top_idx) > 0 else 0.0
+                kws = [str(feature_names[j]) for j in top_idx if center[j] > 0.03]
+                if kws and max_weight >= 0.08:
+                    label_map[i] = f"C{i:02d}: {', '.join(kws)}"
+                else:
+                    label_map[i] = f"C{i:02d}: 종합·일반 시사"
+
+            c_labels = [label_map[cid] for cid in c_ids]
+            return c_ids, c_labels
+        except Exception:
+            # 폴백: title_vec 기반 경량 군집화
+            mat = np.vstack(vecs_list)
+            step = max(1, len(vecs_list) // k)
+            centers = mat[::step][:k]
+            sims = mat @ centers.T
+            c_ids = np.argmax(sims, axis=1).tolist()
+            c_labels = [f"C{cid}: 주요 이슈" for cid in c_ids]
+            return c_ids, c_labels
+
+    def _load_cluster_centroids_from_db(self, cur: sqlite3.Cursor) -> None:
+        """DB에 저장된 CLUSTER_ID별 title_vec 평균 센트로이드를 메모리에 로드합니다."""
+        rows = cur.execute(
+            "SELECT CLUSTER_ID, CLUSTER_LABEL, title_vec FROM NEWS WHERE title_vec IS NOT NULL"
+        ).fetchall()
+        grouped: dict[int, tuple[str, list[np.ndarray]]] = {}
+        for cid, clabel, blob in rows:
+            if blob is None:
+                continue
+            v = np.frombuffer(blob, dtype=np.float32)
+            if len(v) != self.embedding_dim:
+                continue
+            if cid not in grouped:
+                grouped[cid] = (clabel or f"C{cid}", [])
+            grouped[cid][1].append(v)
+
+        self.cluster_centroids.clear()
+        for cid, (clabel, vlist) in grouped.items():
+            mean_v = np.mean(np.vstack(vlist), axis=0).astype(np.float32)
+            norm = float(np.linalg.norm(mean_v))
+            if norm > 0:
+                mean_v /= norm
+            self.cluster_centroids[int(cid)] = (clabel, mean_v)
 
     def crawl_topic_and_save_to_db(self, query: str, max_articles: int = 8) -> int:
         """
-        [에이전트 도구: 주제별 뉴스 크롤링 & news.db 저장]
+        [에이전트 도구: 주제별 뉴스 크롤링 & news.db + sqlite-vec 자동 색인]
         하나의 주제(query)에 대한 기사들을 서로 다른 신문사별로 긁어와
-        news.db의 LINK, NEWS, RAG_INDEX 테이블에 저장하고 저장된 건수를 반환합니다.
+        LINK, NEWS(CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_LABEL), VEC_NEWS_TITLE, RAG_INDEX에 저장합니다.
         """
         search_url = f"https://search.naver.com/search.naver?where=news&query={quote_plus(query)}"
         try:
@@ -382,7 +790,6 @@ class NewsDBRAG:
             if all(u != x[0] for x in all_found):
                 all_found.append((u, oid))
 
-        # 신문사(OID)가 겹치지 않게 우선 선발하여 다양한 신문사 관점을 확보
         for u, oid in all_found:
             if oid not in seen_oids:
                 candidate_urls.append(u)
@@ -398,8 +805,9 @@ class NewsDBRAG:
 
         q_keywords = extract_keywords(query)
         min_required_kws = 1 if len(q_keywords) <= 1 else max(2, (len(q_keywords) + 1) // 2)
+
         saved_count = 0
-        with sqlite3.connect(self.db_path) as con:
+        with connect_vec_db(self.db_path) as con:
             cur = con.cursor()
             for article_url in candidate_urls:
                 existing = cur.execute("SELECT PK FROM LINK WHERE URL = ?", (article_url,)).fetchone()
@@ -422,6 +830,13 @@ class NewsDBRAG:
                 if q_keywords and (matched_kws < min_required_kws or not has_subject):
                     continue
 
+                norm_title = re.sub(r"\s+", " ", title).strip()
+                c_title = preprocess_title(norm_title) or norm_title
+                t_vec = text_to_vector(c_title, dim=self.embedding_dim)
+                t_blob = serialize_vec(t_vec)
+                cat, _ = self._classify_category_from_vec(c_title, t_vec)
+                best_cid, best_clabel = self._match_nearest_cluster(t_vec)
+
                 # 1. LINK 테이블 저장
                 cur.execute(
                     "INSERT INTO LINK(DEPTH, REFERER, URL) VALUES (?, ?, ?)",
@@ -429,35 +844,48 @@ class NewsDBRAG:
                 )
                 link_pk = cur.lastrowid
 
-                # 2. NEWS 테이블 저장
+                # 2. NEWS 테이블 저장 (CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL 포함)
                 cur.execute(
-                    "INSERT INTO NEWS(FK, TITLE, CONTENT) VALUES (?, ?, ?)",
-                    (link_pk, title, body),
+                    """
+                    INSERT INTO NEWS(FK, TITLE, CONTENT, CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (link_pk, norm_title, body, c_title, t_blob, cat, best_cid, best_clabel),
                 )
                 news_pk = cur.lastrowid
                 regdate = cur.execute("SELECT REGDATE FROM NEWS WHERE PK = ?", (news_pk,)).fetchone()[0]
 
-                # 3. RAG_INDEX 테이블 즉시 인덱싱
-                clean_title = re.sub(r"\s+", " ", title).strip()
+                # 3. sqlite-vec VEC_NEWS_TITLE 가상 테이블 즉시 인덱싱
+                cur.execute(
+                    "INSERT OR REPLACE INTO VEC_NEWS_TITLE(news_pk, title_vec) VALUES (?, ?)",
+                    (news_pk, t_blob),
+                )
+
+                # 4. RAG_INDEX 테이블 즉시 인덱싱
                 clean_body = mask_sensitive_info(body)
                 press = extract_press_name(article_url, body)
-                kw_list = extract_keywords(f"{clean_title} {clean_title} {clean_body[:600]}")
-                emb = text_to_vector(f"{clean_title} {clean_title} {clean_body[:800]}", dim=self.embedding_dim)
+                kw_list = extract_keywords(f"{c_title} {c_title} {clean_body[:400]}")
 
                 cur.execute(
                     """
                     INSERT OR REPLACE INTO RAG_INDEX
-                    (NEWS_PK, PRESS, URL, TITLE, CLEAN_CONTENT, KEYWORDS, EMBEDDING, REGDATE)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (NEWS_PK, PRESS, URL, TITLE, CLEAN_TITLE, CATEGORY, CLUSTER_ID, CLUSTER_LABEL,
+                     CLEAN_CONTENT, KEYWORDS, EMBEDDING, title_vec, REGDATE)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         news_pk,
                         press,
                         article_url,
-                        clean_title,
+                        norm_title,
+                        c_title,
+                        cat,
+                        best_cid,
+                        best_clabel,
                         clean_body,
                         " ".join(kw_list[:60]),
-                        emb.tobytes(),
+                        t_blob,
+                        t_blob,
                         regdate or "",
                     ),
                 )
@@ -465,6 +893,23 @@ class NewsDBRAG:
             con.commit()
 
         return saved_count
+
+    def _match_nearest_cluster(self, vec: np.ndarray) -> tuple[int, str]:
+        """주어진 title_vec과 가장 가까운 이슈 클러스터 ID 및 라벨을 반환합니다."""
+        if not self.cluster_centroids:
+            return 0, "C00: 주요 시사"
+        best_cid = 0
+        best_label = "C00: 주요 시사"
+        best_sim = -1.0
+        for cid, (clabel, cvec) in self.cluster_centroids.items():
+            if "종합·일반" in clabel:
+                continue
+            sim = float(np.dot(vec, cvec))
+            if sim > best_sim:
+                best_sim = sim
+                best_cid = cid
+                best_label = clabel
+        return best_cid, best_label
 
     def retrieve(
         self,
@@ -474,32 +919,50 @@ class NewsDBRAG:
         diversify_press: bool = True,
     ) -> list[RetrievedArticle]:
         """
-        질문(query)에 대해 벡터 코사인 유사도 + 키워드 매칭 하이브리드 점수를 계산하고,
-        신문사별 다양성(Press Diversity)을 보장하여 상위 기사를 반환합니다.
+        sqlite-vec 확장(vec_distance_cosine(title_vec, ?))을 활용하여
+        DB 엔진 내부에서 고속으로 title_vec 코사인 유사도를 계산하고,
+        키워드 매칭 및 신문사별 다양성(Press Diversity)을 결합해 상위 기사를 반환합니다.
         """
         q_keywords = extract_keywords(query)
         q_vec = text_to_vector(query, dim=self.embedding_dim)
+        q_blob = serialize_vec(q_vec)
 
-        with sqlite3.connect(self.db_path) as con:
+        with connect_vec_db(self.db_path) as con:
             cur = con.cursor()
+            # sqlite-vec C 확장 함수 vec_distance_cosine(title_vec, ?)으로 SQLite 내부에서 즉시 유사도 산출
             rows = cur.execute(
                 """
-                SELECT NEWS_PK, PRESS, URL, TITLE, CLEAN_CONTENT, KEYWORDS, EMBEDDING, REGDATE
-                FROM RAG_INDEX
-                """
+                SELECT
+                    R.NEWS_PK,
+                    R.PRESS,
+                    R.URL,
+                    R.TITLE,
+                    R.CLEAN_TITLE,
+                    R.CATEGORY,
+                    R.CLUSTER_LABEL,
+                    R.CLEAN_CONTENT,
+                    COALESCE(N.SUMMARY, R.SUMMARY, ''),
+                    R.KEYWORDS,
+                    R.REGDATE,
+                    (1.0 - vec_distance_cosine(R.title_vec, ?)) AS vec_sim
+                FROM RAG_INDEX R
+                LEFT JOIN NEWS N ON N.PK = R.NEWS_PK
+                WHERE R.title_vec IS NOT NULL
+                ORDER BY vec_sim DESC
+                """,
+                (q_blob,),
             ).fetchall()
 
         scored: list[RetrievedArticle] = []
-        for pk, press, url, title, content, kw_str, emb_blob, regdate in rows:
-            doc_vec = np.frombuffer(emb_blob, dtype=np.float32)
-            vec_sim = float(np.dot(q_vec, doc_vec)) if len(doc_vec) == len(q_vec) else 0.0
+        for pk, press, url, title, c_title, category, cluster_label, content, summary, kw_str, regdate, vec_sim_raw in rows:
+            vec_sim = float(vec_sim_raw or 0.0)
 
             kw_score = 0.0
             matched_kw_count = 0
             if q_keywords:
                 matched = 0.0
                 for kw in q_keywords:
-                    if kw in title:
+                    if kw in c_title or kw in title:
                         matched += 2.5
                         matched_kw_count += 1
                     elif kw in content or kw in kw_str:
@@ -509,7 +972,7 @@ class NewsDBRAG:
 
             min_required_kws = 1 if len(q_keywords) <= 1 else max(2, (len(q_keywords) + 1) // 2)
             has_subject_kw = (
-                any(kw in title or kw in content or kw in kw_str for kw in q_keywords[:2])
+                any(kw in c_title or kw in title or kw in content or kw in kw_str for kw in q_keywords[:2])
                 if q_keywords
                 else True
             )
@@ -521,10 +984,15 @@ class NewsDBRAG:
                         news_pk=pk,
                         press=press,
                         title=title,
+                        clean_title=c_title,
+                        category=category,
+                        cluster_label=cluster_label,
                         content=content,
+                        summary=summary or "",
                         url=url,
                         regdate=regdate,
                         score=round(hybrid_score, 4),
+                        title_vec_sim=round(max(0.0, vec_sim), 4),
                     )
                 )
 
@@ -533,7 +1001,6 @@ class NewsDBRAG:
         if not diversify_press or len(scored) <= top_k:
             return scored[:top_k]
 
-        # 신문사별 다양성 보장: 서로 다른 신문사의 최상위 기사를 먼저 1건씩 선발
         selected: list[RetrievedArticle] = []
         used_pks: set[int] = set()
         seen_press: set[str] = set()
@@ -554,6 +1021,241 @@ class NewsDBRAG:
                     break
 
         return selected
+
+    def classify_news_by_title_vec(
+        self,
+        title: str,
+        content: str = "",
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """
+        입력된 뉴스 제목(또는 제목+본문)을 CLEAN_TITLE로 정제하고 title_vec으로 벡터화한 뒤,
+        sqlite-vec 확장(VEC_NEWS_TITLE KNN 검색 & 센트로이드 코사인 거리)을 이용해
+        1) 6대 뉴스 카테고리 분류
+        2) KMeans 이슈 클러스터 분류
+        3) news.db 내 가장 유사한 뉴스 Top-K 검색을 초고속으로 수행합니다.
+        """
+        t0 = time.perf_counter()
+        clean_t = preprocess_title(title) or re.sub(r"\s+", " ", title).strip()
+        t_vec = text_to_vector(f"{clean_t} {preprocess_title(content[:200])}".strip(), dim=self.embedding_dim)
+        t_blob = serialize_vec(t_vec)
+
+        best_cat, cat_scores = self._classify_category_from_vec(clean_t, t_vec)
+        best_cid, best_clabel = self._match_nearest_cluster(t_vec)
+
+        with connect_vec_db(self.db_path) as con:
+            cur = con.cursor()
+            # sqlite-vec VEC_NEWS_TITLE 가상 테이블에서 MATCH 연산자로 초고속 KNN 검색
+            knn_rows = cur.execute(
+                """
+                SELECT
+                    V.news_pk,
+                    V.distance,
+                    N.TITLE,
+                    N.CLEAN_TITLE,
+                    N.CATEGORY,
+                    N.CLUSTER_LABEL,
+                    COALESCE(L.URL, ''),
+                    N.CONTENT
+                FROM VEC_NEWS_TITLE V
+                JOIN NEWS N ON N.PK = V.news_pk
+                LEFT JOIN LINK L ON N.FK = L.PK
+                WHERE V.title_vec MATCH ? AND k = ?
+                """,
+                (t_blob, max(top_k, 8)),
+            ).fetchall()
+
+        similar_articles: list[dict[str, Any]] = []
+        neighbor_cats: list[str] = []
+        for pk, dist, n_title, n_clean, n_cat, n_cluster, n_url, n_body in knn_rows:
+            sim_pct = round(max(0.0, 1.0 - float(dist or 0.0)) * 100, 1)
+            press_name = extract_press_name(n_url, n_body or "")
+            if sim_pct >= 25.0 and n_cat:
+                neighbor_cats.append(n_cat)
+            if len(similar_articles) < top_k:
+                similar_articles.append(
+                    {
+                        "news_pk": pk,
+                        "press": press_name,
+                        "title": n_title,
+                        "clean_title": n_clean,
+                        "category": n_cat or best_cat,
+                        "cluster_label": n_cluster or best_clabel,
+                        "similarity": sim_pct,
+                        "url": n_url or "#source",
+                    }
+                )
+
+        # 최근접 이웃(KNN) 다수결 카테고리와 프로토타입 점수를 결합하여 분류 정밀도 향상
+        if neighbor_cats and similar_articles and similar_articles[0]["similarity"] >= 55.0:
+            from collections import Counter
+
+            top_knn_cat = Counter(neighbor_cats[:3]).most_common(1)[0][0]
+            if cat_scores.get(best_cat, 0.0) < 0.12:
+                best_cat = top_knn_cat
+            if similar_articles[0].get("cluster_label") and "종합·일반" not in similar_articles[0]["cluster_label"]:
+                best_clabel = similar_articles[0]["cluster_label"]
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        cat_ranking = [
+            {
+                "category": c,
+                "icon": NEWS_CATEGORY_SPECS[c]["icon"],
+                "score": round(min(99.0, max(10.0, s * 160 + (20.0 if c == best_cat else 0.0))), 1),
+            }
+            for c, s in sorted(cat_scores.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+        return {
+            "engine": f"sqlite-vec ({self.sqlite_vec_version}) · title_vec[{self.embedding_dim}]",
+            "input_title": title,
+            "clean_title": clean_t,
+            "category": best_cat,
+            "category_icon": NEWS_CATEGORY_SPECS.get(best_cat, {}).get("icon", "📰"),
+            "category_desc": NEWS_CATEGORY_SPECS.get(best_cat, {}).get("desc", ""),
+            "cluster_id": best_cid,
+            "cluster_label": best_clabel,
+            "search_time_ms": elapsed_ms,
+            "category_ranking": cat_ranking,
+            "similar_articles": similar_articles,
+        }
+
+    def get_classification_overview(
+        self,
+        category: str | None = None,
+        cluster_id: int | None = None,
+        limit: int = 18,
+    ) -> dict[str, Any]:
+        """
+        news.db의 title_vec 기반 전체 뉴스 분류 현황(카테고리별 분포, 상위 이슈 클러스터, 분류된 기사 목록)을 반환합니다.
+        """
+        t0 = time.perf_counter()
+        with connect_vec_db(self.db_path) as con:
+            cur = con.cursor()
+            total_news = cur.execute("SELECT COUNT(*) FROM NEWS WHERE title_vec IS NOT NULL").fetchone()[0]
+            vec_index_cnt = cur.execute("SELECT COUNT(*) FROM VEC_NEWS_TITLE").fetchone()[0]
+
+            # 1. 6대 카테고리별 기사 건수 집계
+            cat_rows = cur.execute(
+                """
+                SELECT CATEGORY, COUNT(*) AS cnt
+                FROM NEWS
+                WHERE title_vec IS NOT NULL
+                GROUP BY CATEGORY
+                ORDER BY cnt DESC
+                """
+            ).fetchall()
+
+            categories_summary = []
+            for cat_name, cnt in cat_rows:
+                spec = NEWS_CATEGORY_SPECS.get(cat_name, {"icon": "📰", "desc": ""})
+                categories_summary.append(
+                    {
+                        "category": cat_name,
+                        "icon": spec["icon"],
+                        "desc": spec["desc"],
+                        "count": cnt,
+                        "ratio": round(cnt * 100.0 / max(1, total_news), 1),
+                    }
+                )
+
+            # 2. 상위 이슈 클러스터(CLEAN_TITLE + title_vec 군집) 집계 (단일/일반 잡음 군집 제외)
+            cluster_rows = cur.execute(
+                """
+                SELECT
+                    N.CLUSTER_ID,
+                    N.CLUSTER_LABEL,
+                    N.CATEGORY,
+                    COUNT(*) AS cnt,
+                    MAX(N.TITLE) AS sample_title,
+                    MAX(N.CLEAN_TITLE) AS sample_clean_title
+                FROM NEWS N
+                WHERE N.title_vec IS NOT NULL
+                  AND N.TITLE NOT LIKE '[포토]%'
+                  AND N.CLUSTER_LABEL NOT LIKE '%종합·일반%'
+                GROUP BY N.CLUSTER_ID, N.CLUSTER_LABEL
+                ORDER BY cnt DESC
+                LIMIT 12
+                """
+            ).fetchall()
+
+            clusters_summary = []
+            for cid, clabel, ccat, cnt, stitle, sclean in cluster_rows:
+                kw_part = clabel.split(":", 1)[1].strip() if ":" in clabel else clabel
+                search_q = kw_part.replace(",", "").strip() or sclean
+                clusters_summary.append(
+                    {
+                        "cluster_id": cid,
+                        "cluster_label": clabel,
+                        "category": ccat,
+                        "count": cnt,
+                        "sample_title": stitle,
+                        "search_query": search_q,
+                    }
+                )
+
+            # 3. 선택된 카테고리 또는 클러스터의 기사 목록 조회
+            where_clauses = ["N.title_vec IS NOT NULL", "N.TITLE NOT LIKE '[포토]%'"]
+            params: list[Any] = []
+            if category and category != "전체":
+                where_clauses.append("N.CATEGORY = ?")
+                params.append(category)
+            if cluster_id is not None:
+                where_clauses.append("N.CLUSTER_ID = ?")
+                params.append(cluster_id)
+
+            where_sql = " AND ".join(where_clauses)
+            art_rows = cur.execute(
+                f"""
+                SELECT
+                    N.PK,
+                    N.TITLE,
+                    N.CLEAN_TITLE,
+                    N.CATEGORY,
+                    N.CLUSTER_ID,
+                    N.CLUSTER_LABEL,
+                    COALESCE(L.URL, ''),
+                    N.CONTENT,
+                    COALESCE(N.REGDATE, '')
+                FROM NEWS N
+                LEFT JOIN LINK L ON N.FK = L.PK
+                WHERE {where_sql}
+                ORDER BY N.PK DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+
+            articles_list = []
+            for pk, title, c_title, cat_name, cid, clabel, url, body, regdate in art_rows:
+                articles_list.append(
+                    {
+                        "news_pk": pk,
+                        "press": extract_press_name(url, body or ""),
+                        "title": title,
+                        "clean_title": c_title,
+                        "category": cat_name,
+                        "category_icon": NEWS_CATEGORY_SPECS.get(cat_name, {}).get("icon", "📰"),
+                        "cluster_id": cid,
+                        "cluster_label": clabel,
+                        "url": url or "#source",
+                        "regdate": regdate,
+                    }
+                )
+
+        query_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return {
+            "sqlite_vec_version": self.sqlite_vec_version,
+            "vector_column": "NEWS.title_vec (float32[512])",
+            "virtual_table": "VEC_NEWS_TITLE USING vec0(distance_metric=cosine)",
+            "total_vectorized_news": total_news,
+            "vec_index_count": vec_index_cnt,
+            "index_build_ms": self.last_index_elapsed_ms,
+            "query_elapsed_ms": query_ms,
+            "categories": categories_summary,
+            "clusters": clusters_summary,
+            "articles": articles_list,
+        }
 
     def get_popular_issues(self, limit: int = 5) -> list[dict[str, Any]]:
         """news.db에 실제로 다수 신문사가 보도한 대표 헤드라인 이슈 목록을 반환합니다."""
@@ -608,9 +1310,10 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _summarize_press_opinion(art: RetrievedArticle) -> str:
-    """각 신문사 기사의 핵심 해석/의견 1문장을 추출합니다."""
+    """각 신문사 기사의 핵심 해석/의견 1문장을 추출합니다 (노트북 SLM 요약본이 있으면 우선 활용)."""
+    if art.summary and art.summary.strip():
+        return art.summary.strip()
     sents = _split_sentences(art.content)
-    # 따옴표(인용구)나 평가/분석 어조가 들어간 문장을 우선 선택
     for s in sents:
         if any(cue in s for cue in ('"', "“", "'", "우려", "지적", "강조", "평가", "풀이", "전망", "비판", "필요")):
             return s
@@ -624,14 +1327,13 @@ def _extractive_compare_articles(
 ) -> dict[str, Any]:
     """
     관련 기사들을 하나의 통합 헤드라인으로 묶어 요약하고,
-    신문사별 해석 차이를 가장 대비되는 두 관점(관점 A vs 관점 B)으로 분류하여 비교합니다.
+    title_vec 의미 벡터 거리 기준으로 가장 대비되는 두 관점(관점 A vs 관점 B)으로 분류하여 비교합니다.
     """
     press_set = sorted({a.press for a in articles})
     top_art = articles[0]
 
-    # 의미 벡터 거리 기준으로 가장 대비되는 두 중심 기사를 찾아 관점 A / 관점 B 클러스터 분할
     if len(articles) >= 2:
-        vecs = [text_to_vector(f"{a.title} {a.content[:500]}") for a in articles]
+        vecs = [text_to_vector(f"{a.clean_title or a.title} {a.content[:400]}") for a in articles]
         max_dist = -1.0
         seed_a, seed_b = 0, 1
         for i in range(len(articles)):
@@ -656,7 +1358,6 @@ def _extractive_compare_articles(
         group1 = list(articles)
         group2 = list(articles)
 
-    # 1. 하나의 헤드라인으로 통합 (관점 A 대표 초점 vs 관점 B 대표 초점)
     g1_press_names = "·".join(dict.fromkeys(a.press for a in group1[:3]))
     g2_press_names = "·".join(dict.fromkeys(a.press for a in group2[:3]))
     unified_headline = (
@@ -664,7 +1365,6 @@ def _extractive_compare_articles(
         f"{g1_press_names} 등 {len(press_set)}개 신문사별 해석·관점 종합"
     )
 
-    # 2. 공통 기사 내용 요약
     lead_sents: list[str] = []
     for art in articles[:3]:
         sents = _split_sentences(art.content)
@@ -673,12 +1373,11 @@ def _extractive_compare_articles(
     common_summary = " ".join(lead_sents[:2]) if lead_sents else top_art.content[:280]
 
     common_points = [
-        f"<strong>공통 보도 팩트:</strong> {len(press_set)}개 신문사({', '.join(press_set[:6])})가 ‘{query}’ 사안을 주요 의제로 보도",
+        f"<strong>공통 보도 팩트:</strong> {len(press_set)}개 신문사({', '.join(press_set[:6])})가 ‘{query}’ 사안을 주요 의제로 보도 (분류: {top_art.category})",
         f"<strong>관점 A ({g1_press_names} 등):</strong> {group1[0].title} 중심 해석",
         f"<strong>관점 B ({g2_press_names} 등):</strong> {group2[0].title} 중심 해석",
     ]
 
-    # 3. 관점 A (주장 1) 신문사별 의견 요약
     g1_opinions = [_summarize_press_opinion(a) for a in group1[:2]]
     claim1_summary = " ".join(g1_opinions) if g1_opinions else group1[0].content[:220]
     claim1_points = [
@@ -687,7 +1386,6 @@ def _extractive_compare_articles(
     ]
     claim1_press = [{"name": a.press, "title": a.title, "url": a.url} for a in group1[:4]]
 
-    # 4. 관점 B (주장 2) 신문사별 의견 요약
     g2_opinions = [_summarize_press_opinion(a) for a in group2[:2]]
     claim2_summary = " ".join(g2_opinions) if g2_opinions else group2[0].content[:220]
     claim2_points = [
@@ -696,15 +1394,13 @@ def _extractive_compare_articles(
     ]
     claim2_press = [{"name": a.press, "title": a.title, "url": a.url} for a in group2[:4]]
 
-    crawl_note = (
-        f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
-    )
+    crawl_note = f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
 
     return {
         "headline": unified_headline,
         "meta": [
             f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
-            f"최고 유사도: {top_art.score:.2f} (SQLite 하이브리드 RAG)",
+            f"벡터 색인: sqlite-vec (title_vec 최고 유사도 {top_art.score:.2f} · 분류: {top_art.category})",
             "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
         ],
         "summary": common_summary,
@@ -722,9 +1418,9 @@ def _extractive_compare_articles(
 
 class NewsLensAgent:
     """
-    A2 문제 정의 구현 에이전트:
-    1) 주제에 대한 DB(news.db) 기사 검색
-    2) DB 내 신문사별 기사가 부족하면 실시간 크롤링 도구로 긁어와 news.db에 저장
+    A2 문제 정의 + sqlite-vec (title_vec) 고속 검색·분류 에이전트:
+    1) 주제에 대한 DB(news.db) title_vec 기반 고속 검색
+    2) DB 내 신문사별 기사가 부족하면 실시간 크롤링 도구로 긁어와 news.db에 저장 및 벡터 색인
     3) 하나의 헤드라인으로 묶어 공통 요약 + 신문사별 의견(관점 A vs 관점 B) 비교
     """
 
@@ -747,7 +1443,6 @@ class NewsLensAgent:
         builder.add_edge(START, "analyze_query")
         builder.add_edge("analyze_query", "retrieve_news")
 
-        # 1차 판단: DB 내 서로 다른 신문사가 3곳 이상이면 바로 비교·요약, 부족하면 실시간 크롤링 도구 호출
         builder.add_conditional_edges(
             "retrieve_news",
             self.decide_crawl_or_compare,
@@ -757,7 +1452,6 @@ class NewsLensAgent:
             },
         )
 
-        # 크롤링 후 2차 판단: 크롤링 후에도 관련 기사가 2건 미만이면 환각 방지를 위해 거부 노드로 분기
         builder.add_conditional_edges(
             "crawl_topic_to_db",
             self.route_after_crawl,
@@ -794,7 +1488,7 @@ class NewsLensAgent:
         }
 
     def retrieve_news_node(self, state: AgentState) -> AgentState:
-        """news.db에서 하이브리드 RAG 검색을 수행합니다."""
+        """news.db에서 sqlite-vec title_vec 기반 하이브리드 RAG 검색을 수행합니다."""
         search_text = " ".join(state.get("keywords") or []) or state.get("query", "")
         articles = self.rag.retrieve(search_text, top_k=8, min_score=0.28, diversify_press=True)
         distinct_press = {a.press for a in articles}
@@ -806,7 +1500,6 @@ class NewsLensAgent:
 
     def decide_crawl_or_compare(self, state: AgentState) -> Literal["compare", "crawl"]:
         """
-        [에이전트 판단 단계]
         news.db에 이미 유사도 0.40 이상의 고연관 기사가 3개 이상 신문사에서 확보되어 있으면 즉시 비교·요약하고,
         부족하면 실시간으로 해당 주제의 기사들을 긁어와 news.db에 저장하는 크롤링 도구를 선택합니다.
         """
@@ -818,10 +1511,7 @@ class NewsLensAgent:
         return "crawl"
 
     def crawl_topic_to_db_node(self, state: AgentState) -> AgentState:
-        """
-        [도구 실행 단계]
-        주제에 대한 기사들을 실시간으로 긁어와 news.db에 저장한 뒤 재검색합니다.
-        """
+        """주제에 대한 기사들을 실시간으로 긁어와 news.db에 저장 및 title_vec 색인 후 재검색합니다."""
         search_text = " ".join(state.get("keywords") or []) or state.get("query", "")
         added = self.rag.crawl_topic_and_save_to_db(search_text, max_articles=8)
         articles = self.rag.retrieve(search_text, top_k=8, min_score=0.28, diversify_press=True)
@@ -846,12 +1536,12 @@ class NewsLensAgent:
             "result": {
                 "headline": f"‘{q}’에 대한 보도 기사를 찾을 수 없습니다",
                 "meta": [
-                    "수집 출처: news.db 검색 + 실시간 크롤링 결과 0건",
+                    "수집 출처: news.db (sqlite-vec) 검색 + 실시간 크롤링 결과 0건",
                     "환각 방지(성공 기준 1): 근거 없는 추측·가짜 출처 생성 차단됨",
                     f"추천 주제: {suggested}",
                 ],
                 "summary": (
-                    f"로컬 데이터베이스(news.db) 검색 및 실시간 뉴스 크롤링을 모두 수행했으나 ‘{q}’ 주제와 일치하는 "
+                    f"로컬 데이터베이스(news.db) sqlite-vec 벡터 검색 및 실시간 뉴스 크롤링을 모두 수행했으나 ‘{q}’ 주제와 일치하는 "
                     f"신뢰할 수 있는 보도 기사가 확인되지 않았습니다. 에이전트 안전 설계에 따라 없는 자료를 지어내지 않습니다."
                 ),
                 "points": [
@@ -871,10 +1561,7 @@ class NewsLensAgent:
         }
 
     def compare_and_summarize_node(self, state: AgentState) -> AgentState:
-        """
-        검색·수집된 news.db 기사들을 하나의 헤드라인으로 묶어 요약하고 신문사별로 의견을 비교합니다.
-        ANTHROPIC_API_KEY가 있으면 Claude API를 호출하고, 없으면 벡터 클러스터링 기반 추출형 비교 엔진으로 동작합니다.
-        """
+        """검색·수집된 news.db 기사들을 하나의 헤드라인으로 묶어 요약하고 신문사별로 의견을 비교합니다."""
         query = state.get("query", "")
         raw_articles = state.get("articles") or []
         crawled_count = state.get("crawled_count") or 0
@@ -898,6 +1585,7 @@ class NewsLensAgent:
                     context_blocks.append(
                         f"[기사 {idx}]\n"
                         f"- 신문사: {a.press}\n"
+                        f"- 분류: {a.category} ({a.cluster_label})\n"
                         f"- 제목: {a.title}\n"
                         f"- URL: {a.url}\n"
                         f"- 본문 발췌: {a.content[:700]}"
@@ -919,7 +1607,7 @@ class NewsLensAgent:
                 out = parsed.model_dump()
                 out["meta"] = [
                     f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
-                    "분석 모델: Anthropic Claude (LangGraph + news.db RAG)",
+                    "분석 모델: Anthropic Claude (LangGraph + sqlite-vec RAG)",
                     "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
                 ]
                 return {"result": out}
@@ -960,7 +1648,7 @@ class NewsLensAgent:
         return {"result": result}
 
     def run(self, query: str, thread_id: str = "default-session") -> dict[str, Any]:
-        """주제/질문을 입력받아 [DB 검색 -> 부족 시 크롤링·DB저장 -> 헤드라인 통합 요약 -> 신문사별 의견 비교]를 수행합니다."""
+        """주제/질문을 입력받아 [sqlite-vec 검색 -> 부족 시 크롤링·DB저장 -> 헤드라인 통합 요약 -> 신문사별 의견 비교]를 수행합니다."""
         final_state = self.graph.invoke({"query": query, "thread_id": thread_id})
         return final_state["result"]
 
@@ -969,11 +1657,9 @@ agent = NewsLensAgent()
 
 
 if __name__ == "__main__":
-    import json
     import sys
 
     sys.stdout.reconfigure(encoding="utf-8")
     test_query = sys.argv[1] if len(sys.argv) > 1 else "수사기관장 배석 사법개혁"
     res = agent.run(test_query)
     print(json.dumps(res, ensure_ascii=False, indent=2))
-

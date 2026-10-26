@@ -240,8 +240,69 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         <div id="articleJudgmentsList" class="claims-grid" style="gap:18px; align-items:start;">
         </div>
       </section>
+
+      <!-- 04. sqlite-vec (NEWS.title_vec) 기반 뉴스 자동 분류 및 고속 벡터 색인 시스템 -->
+      <section class="summary-box" style="background:#f4f8fa; border:1px solid #cde2ec;" aria-label="sqlite-vec title_vec 기반 뉴스 분류 시스템">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+          <div>
+            <span class="box-tag" style="background:#d8eef8; color:#24566b; padding:4px 10px; border-radius:6px; margin-bottom:6px;">
+              SQLITE-VEC · TITLE_VEC VECTOR CLASSIFIER
+            </span>
+            <h2 style="font-size:19px; letter-spacing:-0.03em; color:var(--text-main);">
+              sqlite-vec (<code>title_vec</code>) 기반 뉴스 자동 분류 &amp; 고속 색인 시스템
+            </h2>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <span id="vecEngineBadge" style="font-size:11px; font-weight:700; padding:5px 11px; border-radius:99px; background:#e6f4ea; color:#1b4332; border:1px solid #95d5b2;">
+              sqlite-vec 로딩 중...
+            </span>
+            <button type="button" onclick="rebuildTitleVecIndex()" style="font-size:11px; font-weight:700; padding:6px 12px; border-radius:8px; border:1px solid #24566b; background:#fff; color:#24566b;">
+              title_vec 색인 재구축 ↻
+            </button>
+          </div>
+        </div>
+
+        <!-- 실시간 제목 벡터(title_vec) 분류 테스트 입력창 -->
+        <div style="background:#fff; border:1px solid #cde2ec; border-radius:12px; padding:16px; margin-bottom:18px;">
+          <div style="font-size:13px; font-weight:800; margin-bottom:8px; color:var(--text-main);">
+            실시간 <code>CLEAN_TITLE → title_vec</code> 뉴스 분류 &amp; 유사 기사 KNN 검색기
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <input id="vecClassifyTitleInput" type="text" value="한국은행 기준금리 동결 결정… 환율 1400원대 및 가계부채 리스크 고려" placeholder="분류할 뉴스 기사 제목을 입력해 보세요" style="flex:1; min-width:240px; padding:10px 14px; border:1px solid #bcc3b1; border-radius:10px; font-size:12.5px;">
+            <button type="button" onclick="runTitleVecClassification()" class="search-btn" style="padding:10px 18px; font-size:12.5px; background:#24566b; border-color:#24566b;">
+              title_vec 벡터 분류 실행 ↗
+            </button>
+          </div>
+          <div id="vecClassifyResultBox" style="display:none; margin-top:12px; padding:14px 16px; background:#f8fbfd; border-radius:10px; border:1px solid #cde2ec; font-size:12.5px;">
+          </div>
+        </div>
+
+        <!-- 6대 뉴스 카테고리 분포 탭 -->
+        <div style="font-size:12px; font-weight:800; color:var(--text-sub); margin-bottom:8px;">
+          1) <code>NEWS.title_vec</code> 기반 6대 뉴스 카테고리 자동 분류 현황 (클릭 시 해당 분야 뉴스 필터링)
+        </div>
+        <div id="vecCategoryTabs" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
+        </div>
+
+        <!-- KMeans(CLEAN_TITLE + title_vec) 주요 이슈 클러스터 -->
+        <div style="font-size:12px; font-weight:800; color:var(--text-sub); margin-bottom:8px;">
+          2) <code>CLEAN_TITLE + title_vec</code> 의미 군집(Cluster) 상위 이슈 (클릭 시 신문사별 관점 비교 실행)
+        </div>
+        <div id="vecClusterChips" style="display:flex; gap:7px; flex-wrap:wrap; margin-bottom:16px;">
+        </div>
+
+        <!-- 분류된 news.db 기사 목록 -->
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <span id="vecArticlesTitle" style="font-size:12px; font-weight:800; color:var(--text-sub);">
+            분류된 news.db 기사 목록 (CLEAN_TITLE &amp; title_vec 색인 완료)
+          </span>
+          <span id="vecQueryTimeLabel" style="font-size:11px; color:var(--text-muted);"></span>
+        </div>
+        <div id="vecClassifiedArticlesGrid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); gap:10px;">
+        </div>
+      </section>
     </div>
-  </main><footer class="newsletter-footer"><strong>논점콩</strong><span>하나의 시선에 머물지 않는 뉴스 읽기 · news.db RAG &amp; OpenAI 기사 판단</span></footer>
+  </main><footer class="newsletter-footer"><strong>논점콩</strong><span>하나의 시선에 머물지 않는 뉴스 읽기 · news.db sqlite-vec (title_vec) &amp; OpenAI 기사 판단</span></footer>
 
   <script>
     const ISSUE_DATA = {
@@ -431,20 +492,27 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         const renderCard = (item, isA) => {
           const bgBadge = isA ? "var(--claim1-bg)" : "var(--claim2-bg)";
           const colBadge = isA ? "var(--claim1-accent)" : "var(--claim2-accent)";
+          const catBadge = item.category ? `<span style="font-size:10.5px; font-weight:800; padding:2px 7px; border-radius:999px; background:#edf2e1; color:#2b411c;">${item.category}</span>` : "";
+          const clusterBadge = item.clusterLabel ? `<span style="font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:999px; background:#e8f3f8; color:#24566b;">${item.clusterLabel}</span>` : "";
           return `
             <div style="background:#fff; border:1px solid var(--border-soft); border-radius:10px; padding:13px 15px; display:flex; flex-direction:column; justify-content:space-between; gap:8px;">
               <div>
-                <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:6px;">
-                  <span style="font-size:11px; font-weight:800; padding:3px 8px; border-radius:6px; background:${bgBadge}; color:${colBadge};">
-                    ${item.press} · ${item.stance}
-                  </span>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:6px; flex-wrap:wrap;">
+                  <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap;">
+                    <span style="font-size:11px; font-weight:800; padding:3px 8px; border-radius:6px; background:${bgBadge}; color:${colBadge};">
+                      ${item.press} · ${item.stance}
+                    </span>
+                    ${catBadge}
+                    ${clusterBadge}
+                  </div>
                   <span style="font-size:11px; font-weight:700; color:var(--text-muted);">
-                    연관도 ${item.relevanceScore}%
+                    title_vec 연관도 ${item.relevanceScore}%
                   </span>
                 </div>
-                <div style="font-size:13px; font-weight:800; line-height:1.45; margin-bottom:5px; color:var(--text-main);">
+                <div style="font-size:13px; font-weight:800; line-height:1.45; margin-bottom:4px; color:var(--text-main);">
                   ${item.title}
                 </div>
+                ${item.cleanTitle ? `<div style="font-size:11px; color:var(--text-muted); margin-bottom:5px;"><code>CLEAN_TITLE:</code> ${item.cleanTitle}</div>` : ""}
                 <div style="font-size:12px; color:var(--text-sub); line-height:1.6;">
                   ${item.judgmentSummary}
                 </div>
@@ -552,11 +620,14 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
         });
         if (res.ok) {
           const d = await res.json();
+          const vc = d.vecClassification || {};
+          const topScore = (vc.category_ranking && vc.category_ranking[0]) ? vc.category_ranking[0].score : 90;
           outBox.innerHTML = `
             <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
               <strong>[${d.press}] 판정: ${d.verdict} (신뢰도 ${d.trustScore}점)</strong>
               <span style="font-size:11px; font-weight:700; color:#24566b;">${d.engine} · 논조: ${d.tone}</span>
             </div>
+            ${vc.category ? `<div style="margin-bottom:4px; font-size:12px;"><strong>sqlite-vec 분류:</strong> <span style="background:#edf2e1; padding:2px 7px; border-radius:6px; font-weight:800; color:#2b411c;">${vc.category_icon || ""} ${vc.category} (${topScore}%)</span> · <span style="background:#e8f3f8; padding:2px 7px; border-radius:6px; font-weight:700; color:#24566b;">${vc.cluster_label || ""}</span> <span style="color:var(--text-muted);">(${vc.search_time_ms}ms)</span></div>` : ""}
             <div style="margin-bottom:4px;"><strong>핵심 주장:</strong> ${d.keyClaim}</div>
             <div><strong>판단 근거:</strong> ${d.analysis}</div>
           `;
@@ -564,6 +635,191 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
       } catch (_) {
         outBox.innerHTML = "서버 연결 상태를 확인해 주세요.";
       }
+    }
+
+    let selectedVecCategory = "전체";
+    let selectedVecClusterId = null;
+
+    async function loadVecClassifications(category = "전체", clusterId = null) {
+      selectedVecCategory = category;
+      selectedVecClusterId = clusterId;
+      try {
+        const params = new URLSearchParams();
+        if (category) params.set("category", category);
+        if (clusterId !== null && clusterId !== undefined) params.set("cluster_id", String(clusterId));
+        params.set("limit", "12");
+
+        const res = await fetch(`/api/vec-classifications?${params.toString()}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const totalCount = data.total_vectorized_news || 0;
+        const elapsedMs = data.query_elapsed_ms || 0;
+
+        const badge = document.getElementById("vecEngineBadge");
+        if (badge) {
+          badge.textContent = `sqlite-vec (${data.sqlite_vec_version || "v0.1.9"}) · title_vec ${totalCount}건 색인 (${elapsedMs}ms)`;
+        }
+
+        const timeLabel = document.getElementById("vecQueryTimeLabel");
+        if (timeLabel) {
+          timeLabel.textContent = `sqlite-vec 조회: ${elapsedMs}ms · 색인 생성 ${data.index_build_ms || 0}ms · 표시 ${data.articles ? data.articles.length : 0}건`;
+        }
+
+        const tabsEl = document.getElementById("vecCategoryTabs");
+        if (tabsEl && data.categories) {
+          const allActive = (!category || category === "전체") && clusterId === null;
+          let html = `
+            <button type="button" onclick="loadVecClassifications('전체', null)"
+              style="padding:7px 13px; border-radius:999px; font-size:12px; font-weight:800; cursor:pointer; border:1px solid ${allActive ? '#2b411c' : '#cbd5b0'}; background:${allActive ? '#2b411c' : '#fff'}; color:${allActive ? '#fff' : 'var(--text-main)'};">
+              전체 (${totalCount}건)
+            </button>
+          `;
+          for (const c of data.categories) {
+            const isActive = category === c.category && clusterId === null;
+            html += `
+              <button type="button" onclick="loadVecClassifications('${c.category}', null)"
+                style="padding:7px 13px; border-radius:999px; font-size:12px; font-weight:800; cursor:pointer; border:1px solid ${isActive ? '#2b411c' : '#cbd5b0'}; background:${isActive ? '#2b411c' : '#fff'}; color:${isActive ? '#fff' : 'var(--text-main)'};">
+                ${c.icon || ""} ${c.category} <span style="font-weight:700; opacity:0.85;">${c.count}건 (${c.ratio}%)</span>
+              </button>
+            `;
+          }
+          tabsEl.innerHTML = html;
+        }
+
+        const clustersEl = document.getElementById("vecClusterChips");
+        if (clustersEl && data.clusters) {
+          clustersEl.innerHTML = data.clusters.map((cl) => {
+            const isActive = clusterId === cl.cluster_id;
+            const searchKw = cl.search_query || (cl.cluster_label || "").replace(/^C\d+:\s*/, "").replace(/,\s*/g, " ");
+            return `
+              <div style="display:inline-flex; align-items:center; background:${isActive ? '#24566b' : '#fff'}; border:1px solid ${isActive ? '#24566b' : '#cde2ec'}; border-radius:999px; overflow:hidden;">
+                <button type="button" onclick="loadVecClassifications('전체', ${cl.cluster_id})"
+                  style="padding:5px 10px; border:none; background:transparent; color:${isActive ? '#fff' : '#24566b'}; font-size:11.5px; font-weight:800; cursor:pointer;">
+                  ${cl.cluster_label} (${cl.count}건)
+                </button>
+                <button type="button" onclick="searchByKeyword('${searchKw.replace(/'/g, "")}')"
+                  title="이 군집 키워드로 신문사별 관점 비교 실행"
+                  style="padding:5px 8px; border:none; border-left:1px solid #cde2ec; background:#eef7fb; color:#24566b; font-size:10.5px; font-weight:800; cursor:pointer;">
+                  비교 ↗
+                </button>
+              </div>
+            `;
+          }).join("");
+        }
+
+        const gridEl = document.getElementById("vecClassifiedArticlesGrid");
+        if (gridEl && data.articles) {
+          gridEl.innerHTML = data.articles.map((art) => `
+            <div style="background:#fff; border:1px solid var(--border-soft); border-radius:10px; padding:12px 14px; display:flex; flex-direction:column; justify-content:space-between; gap:6px;">
+              <div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:5px; margin-bottom:6px; flex-wrap:wrap;">
+                  <span style="font-size:10.5px; font-weight:800; padding:2px 8px; border-radius:999px; background:#edf2e1; color:#2b411c;">
+                    ${art.category_icon || ""} ${art.category}
+                  </span>
+                  <span style="font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:999px; background:#e8f3f8; color:#24566b;">
+                    ${art.cluster_label}
+                  </span>
+                </div>
+                <div style="font-size:12.5px; font-weight:800; color:var(--text-main); line-height:1.45; margin-bottom:4px;">
+                  [${art.press}] ${art.title}
+                </div>
+                <div style="font-size:11px; color:#4b6043; background:#f8faef; padding:4px 7px; border-radius:6px; border:1px dashed #d5dfc3;">
+                  <code>CLEAN_TITLE:</code> ${art.clean_title}
+                </div>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; padding-top:6px; border-top:1px dashed var(--border-soft); font-size:10.5px; color:var(--text-muted);">
+                <span>PK #${art.news_pk} · <code>title_vec[512]</code></span>
+                <div style="display:flex; gap:6px;">
+                  <button type="button" onclick="searchByKeyword('${(art.clean_title || art.title).replace(/'/g, "").slice(0, 30)}')"
+                    style="border:none; background:#eef2df; color:#2b411c; font-size:10.5px; font-weight:800; padding:2px 7px; border-radius:5px; cursor:pointer;">
+                    이슈 분석
+                  </button>
+                  <a href="${art.url || '#'}" target="_blank" rel="noopener noreferrer" style="color:#24566b; font-weight:700; text-decoration:none;">원문 ↗</a>
+                </div>
+              </div>
+            </div>
+          `).join("");
+        }
+      } catch (_) {}
+    }
+
+    async function runTitleVecClassification() {
+      const inputEl = document.getElementById("vecClassifyTitleInput");
+      const boxEl = document.getElementById("vecClassifyResultBox");
+      const title = inputEl ? inputEl.value.trim() : "";
+      if (!title || !boxEl) return;
+
+      boxEl.style.display = "block";
+      boxEl.innerHTML = "sqlite-vec (VEC_NEWS_TITLE) 코사인 유사도 검색 및 카테고리 분류 중...";
+
+      try {
+        const res = await fetch("/api/classify-news", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, content: "", top_k: 5 })
+        });
+        if (!res.ok) return;
+        const d = await res.json();
+
+        const catScoresHtml = (d.category_ranking || [])
+          .slice(0, 4)
+          .map((item) => `<span style="font-size:11px; padding:2px 7px; border-radius:6px; background:#f4f7ec; border:1px solid #d8e2c3;">${item.icon || ""} ${item.category}: <strong>${item.score}%</strong></span>`)
+          .join(" ");
+
+        const nnList = d.similar_articles || [];
+        const nnHtml = nnList.map((n) => `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 8px; background:#fff; border:1px solid #e3ead2; border-radius:7px; font-size:11.5px;">
+            <div>
+              <span style="font-weight:800; color:#2b411c;">[${n.press}]</span>
+              <span style="font-weight:700;">${n.title}</span>
+              <span style="color:var(--text-muted); font-size:10.5px;">(CLEAN_TITLE: ${n.clean_title})</span>
+            </div>
+            <div style="white-space:nowrap; display:flex; gap:5px; align-items:center;">
+              <span style="background:#edf2e1; color:#2b411c; font-size:10.5px; font-weight:800; padding:2px 6px; border-radius:5px;">${n.category}</span>
+              <span style="background:#e8f3f8; color:#24566b; font-size:10.5px; font-weight:800; padding:2px 6px; border-radius:5px;">유사도 ${n.similarity}%</span>
+            </div>
+          </div>
+        `).join("");
+
+        const topConfidence = (d.category_ranking && d.category_ranking[0]) ? d.category_ranking[0].score : 90;
+
+        boxEl.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+            <div>
+              <span style="font-size:11.5px; color:var(--text-muted);">전처리된 <code>CLEAN_TITLE</code>:</span>
+              <code style="font-size:12px; font-weight:800; color:#2b411c; background:#fff; padding:2px 7px; border-radius:5px; margin-left:4px;">${d.clean_title}</code>
+            </div>
+            <span style="font-size:11px; font-weight:800; color:#24566b;">
+              ${d.engine} · 검색 속도 ${d.search_time_ms}ms
+            </span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+            <span style="font-size:12.5px; font-weight:800;">예측 분야: <span style="background:#2b411c; color:#fff; padding:3px 9px; border-radius:999px;">${d.category_icon || ""} ${d.category} (점수 ${topConfidence}%)</span></span>
+            <span style="font-size:12px; font-weight:800;">예측 이슈 군집: <span style="background:#24566b; color:#fff; padding:3px 9px; border-radius:999px;">${d.cluster_label}</span></span>
+            ${catScoresHtml}
+          </div>
+          <div style="font-size:11.5px; font-weight:800; color:var(--text-sub); margin-bottom:5px;">
+            <code>VEC_NEWS_TITLE</code> 코사인 최근접 이웃 기사 Top-${nnList.length}:
+          </div>
+          <div style="display:flex; flex-direction:column; gap:5px;">
+            ${nnHtml}
+          </div>
+        `;
+      } catch (_) {
+        boxEl.innerHTML = "분류 API 호출 중 오류가 발생했습니다.";
+      }
+    }
+
+    async function rebuildTitleVecIndex() {
+      const badge = document.getElementById("vecEngineBadge");
+      if (badge) badge.textContent = "title_vec 재색인 중...";
+      try {
+        const res = await fetch("/api/rebuild-vec-index", { method: "POST" });
+        if (res.ok) {
+          await loadVecClassifications(selectedVecCategory, selectedVecClusterId);
+        }
+      } catch (_) {}
     }
 
     function loadIssue(key, btn) {
@@ -653,6 +909,7 @@ button,input{font:inherit}button,a,input{ -webkit-tap-highlight-color:transparen
 
     window.addEventListener("DOMContentLoaded", () => {
       refreshOpenAIStatus();
+      loadVecClassifications("전체", null);
       runQuery("김여정 대북 확성기 철거 남북관계");
     });
   </script>
