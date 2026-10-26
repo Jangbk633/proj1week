@@ -1,5 +1,11 @@
 .env
 *.pdf
 *.pptx
-.venv/*
+*.ipynb
+
+
 __pycache__/*
+
+.venv/*
+.vscode/*
+.ipynb_checkpoints/*

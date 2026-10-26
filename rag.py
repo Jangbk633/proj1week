@@ -1,213 +1,34 @@
 """
-rag_agent.py - A2 문제 정의 + sqlite-vec (title_vec) 고속 벡터 색인 & 뉴스 자동 분류 AI 에이전트:
-1. NEWS.CLEAN_TITLE 전처리 및 NEWS.title_vec (float32[512]) 벡터화
-2. sqlite-vec 확장(VEC_NEWS_TITLE vec0 가상 테이블 & vec_distance_cosine)을 통한 초고속 색인·검색
-3. title_vec 기반 뉴스 자동 분류 시스템 (6대 뉴스 카테고리 분류 + KMeans 이슈 클러스터 분류 + 관점 A/B 분류)
-4. LangGraph 기반 신문사별 관점 비교·통합 헤드라인 요약 및 출처 검증
+rag.py - news.db (SQLite + sqlite-vec 확장) 기반 고속 벡터 색인, 6대 카테고리 및 KMeans 이슈 군집화,
+하이브리드 RAG 검색, 실시간 네이버 뉴스 크롤링 모듈
 """
 
 from __future__ import annotations
 
-import hashlib
-import html
-import json
-import os
 from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Any, Literal, TypedDict
+from typing import Any
 from urllib.parse import quote_plus
 
-from dotenv import load_dotenv
 import httpx
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import sqlite_vec
 
-load_dotenv()
+from preprocessing import (
+    HTTP_HEADERS,
+    extract_keywords,
+    extract_press_name,
+    mask_sensitive_info,
+    parse_naver_article_html,
+    preprocess_title,
+)
+from vectorize import TITLE_VEC_DIM, serialize_vec, text_to_vector
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = ROOT_DIR / "news.db"
-TITLE_VEC_DIM = 512
-
-HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-}
-
-# 네이버 뉴스 OID(3자리 언론사 코드) -> 신문사/언론사명 매핑
-OID_TO_PRESS: dict[str, str] = {
-    "001": "연합뉴스",
-    "002": "프레시안",
-    "003": "뉴시스",
-    "005": "국민일보",
-    "006": "미디어오늘",
-    "008": "머니투데이",
-    "009": "매일경제",
-    "011": "서울경제",
-    "014": "파이낸셜뉴스",
-    "015": "한국경제",
-    "016": "헤럴드경제",
-    "018": "이데일리",
-    "020": "동아일보",
-    "021": "문화일보",
-    "022": "세계일보",
-    "023": "조선일보",
-    "025": "중앙일보",
-    "028": "한겨레",
-    "029": "디지털타임스",
-    "030": "전자신문",
-    "031": "아이뉴스24",
-    "032": "경향신문",
-    "033": "주간경향",
-    "036": "한겨레21",
-    "037": "주간동아",
-    "044": "코리아헤럴드",
-    "047": "오마이뉴스",
-    "050": "한경비즈니스",
-    "052": "YTN",
-    "053": "주간조선",
-    "055": "SBS",
-    "056": "KBS",
-    "057": "MBN",
-    "077": "AP통신",
-    "079": "노컷뉴스",
-    "081": "서울신문",
-    "082": "부산일보",
-    "087": "강원일보",
-    "088": "매일신문",
-    "092": "지디넷코리아",
-    "119": "데일리안",
-    "123": "조세일보",
-    "138": "디지털데일리",
-    "214": "MBC",
-    "215": "한국경제TV",
-    "243": "이코노미스트",
-    "277": "아시아경제",
-    "293": "블로터",
-    "076": "스포츠조선",
-    "094": "월간산",
-    "117": "마이데일리",
-    "145": "레이디경향",
-    "241": "일간스포츠",
-    "262": "신동아",
-    "296": "코메디닷컴",
-    "308": "시사IN",
-    "310": "여성신문",
-    "346": "헬스조선",
-    "366": "조선비즈",
-    "374": "SBS Biz",
-    "417": "머니S",
-    "421": "뉴스1",
-    "422": "연합뉴스TV",
-    "437": "JTBC",
-    "448": "TV조선",
-    "449": "채널A",
-    "468": "스포츠서울",
-    "469": "한국일보",
-    "584": "동아사이언스",
-    "586": "시사저널",
-    "629": "더팩트",
-    "640": "코리아중앙데일리",
-    "648": "비즈워치",
-    "654": "강원도민일보",
-    "656": "대전일보",
-    "657": "대구MBC",
-    "658": "국제신문",
-    "659": "전주MBC",
-    "660": "kbc광주방송",
-    "661": "JIBS",
-    "662": "농민신문",
-    "666": "경기일보",
-}
-
-EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
-PHONE_RE = re.compile(r"\b0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}\b")
-TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
-
-STOPWORDS = {
-    "기자", "포토", "단독", "속보", "뉴스", "보도", "관련", "대한", "대해", "어떻게",
-    "비교", "비교해줘", "알려줘", "요약", "요약해줘", "입장", "관점", "신문사별",
-    "언론사별", "최근", "오늘", "지금", "이슈", "논란", "분석", "반응", "생각",
-    "무엇", "어떤", "에서", "으로", "하고", "있다", "밝혔다", "전했다", "말했다",
-    "의견", "해석", "헤드라인", "방금", "요약한", "내용", "그중", "이전", "질문",
-    "질문에서", "다룬", "위에서", "자세히", "신문사", "신문사들의", "언론사", "언론사들의",
-    "입장을", "의견을", "근거", "수치", "수치를", "핵심", "평가하는지", "대해서",
-    "종합", "사진", "영상", "일문일답", "전문", "사설", "칼럼", "단신", "브리핑",
-    "초점", "현장", "르포", "인터뷰", "기획", "연재", "긴급", "주목", "화제", "해설",
-    "만에", "하루", "연중", "내내", "이후", "부터", "까지", "위해", "통해", "따라",
-    "이번", "지난", "내일", "어제", "올해", "내년", "작년", "현재", "당시",
-    "우리", "저희", "그것", "이것", "저것", "여기", "거기", "저기", "모두", "전체", "일부", "각각",
-    "있는", "없는", "하는", "되는", "않는", "같은", "위한", "통한", "따른", "대비", "두고", "놓고",
-    "있어", "없어", "하며", "되며", "되고", "한다", "된다", "했다", "됐다", "할까", "될까",
-}
-
-# preprocessing.ipynb 기반 의미 복원 한자 변환 규칙
-CONTEXTUAL_HANJA_PATTERNS: list[tuple[str, str]] = [
-    (r"李\s*대통령", "이재명 대통령 "),
-    (r"李\s*대표", "이재명 대표 "),
-    (r"尹\s*대통령", "윤석열 대통령 "),
-    (r"尹\s*전\s*대통령", "윤석열 전 대통령 "),
-    (r"文\s*전\s*대통령", "문재인 전 대통령 "),
-    (r"文\s*대통령", "문재인 대통령 "),
-    (r"韓\s*대표", "한동훈 대표 "),
-    (r"韓\s*위원장", "한동훈 위원장 "),
-    (r"吳\s*시장", "오세훈 시장 "),
-    (r"洪\s*시장", "홍준표 시장 "),
-    (r"曺\s*대표", "조국 대표 "),
-    (r"安\s*의원", "안철수 의원 "),
-    (r"與\s*野|與·野", "여당 야당 "),
-    (r"黨\s*政\s*大|당\s*정\s*대", "당정대 "),
-    (r"黨\s*政|黨·政", "당정 "),
-    (r"行\s*安\s*부|행\s*안\s*부", "행정안전부 "),
-    (r"韓\s*국", "한국"),
-    (r"韓·美·日|韓美日", "한국 미국 일본 "),
-    (r"韓·中·日|韓中日", "한국 중국 일본 "),
-    (r"韓·美|韓美|한·美|韓·미", "한국 미국 "),
-    (r"韓·日|韓日|한·日|韓·일", "한국 일본 "),
-    (r"韓·中|韓中|한·中|韓·중", "한국 중국 "),
-    (r"韓·露|韓露|한·露|韓·러", "한국 러시아 "),
-    (r"美·北|美北|北·美|北美", "미국 북한 "),
-    (r"美·中|美中|中·美|中美", "미국 중국 "),
-    (r"美·日|美日|日·美|日美", "미국 일본 "),
-    (r"北·中|北中|中·北|中北", "북한 중국 "),
-    (r"北·露|北露|露·北|露北", "북한 러시아 "),
-    (r"방韓|訪韓", "방한"),
-    (r"내韓|來韓", "내한"),
-    (r"주韓|駐韓", "주한"),
-    (r"반韓|反韓", "반한"),
-    (r"친韓|親韓", "친한"),
-    (r"혐韓|嫌韓", "혐한"),
-    (r"주한\s*美\s*군", "주한 미군 "),
-    (r"(?<=[방내주반친혐대訪來駐反親嫌對])美", "미"),
-    (r"(?<=[방내주반친혐대訪來駐反親嫌對])中", "중"),
-    (r"(?<=[방내주반친혐대訪來駐反親嫌對])日", "일"),
-    (r"(?<=[방내주반친혐대訪來駐反親嫌對])北", "북"),
-    (r"(?<=[방내주반친혐대訪來駐反親嫌對])露", "러"),
-]
-
-SEMANTIC_HANJA_DICT: dict[str, str] = {
-    "李": "이재명 ", "尹": "윤석열 ", "韓": "한동훈 ", "文": "문재인 ",
-    "洪": "홍준표 ", "吳": "오세훈 ", "安": "안철수 ", "曺": "조국 ",
-    "美": "미국 ", "北": "북한 ", "中": "중국 ", "日": "일본 ", "露": "러시아 ",
-    "英": "영국 ", "佛": "프랑스 ", "獨": "독일 ", "臺": "대만 ",
-    "與": "여당 ", "野": "야당 ", "政": "정부 ", "檢": "검찰 ", "警": "경찰 ",
-    "軍": "군대 ", "靑": "청와대 ", "法": "법원 ", "銀": "은행 ", "證": "증권 ",
-    "企": "기업 ", "黨": "정당 ",
-}
-
-PHONETIC_HANJA_TRANS = str.maketrans({
-    "萬": "만", "億": "억", "兆": "조",
-    "年": "년", "月": "월", "時": "시", "分": "분", "秒": "초",
-    "大": "대", "小": "소", "新": "신", "舊": "구", "高": "고", "低": "저", "多": "다", "少": "소",
-    "前": "전", "後": "후", "上": "상", "下": "하", "內": "내", "外": "외", "左": "좌", "右": "우",
-    "正": "정", "副": "부", "親": "친", "反": "반", "非": "비", "汎": "범", "全": "전",
-    "對": "대", "發": "발", "行": "행", "故": "고", "無": "무", "有": "유", "重": "중", "輕": "경",
-    "株": "주", "債": "채", "稅": "세", "金": "금", "院": "원", "朴": "박",
-})
 
 # title_vec 기반 6대 뉴스 분류 카테고리 정의 (대표 시드 어휘 및 설명)
 NEWS_CATEGORY_SPECS: dict[str, dict[str, str]] = {
@@ -271,161 +92,6 @@ def connect_vec_db(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return con
 
 
-def preprocess_title(text: str) -> str:
-    """
-    preprocessing.ipynb 규칙과 동일하게 뉴스 제목의 한자어를 의미 복원하고
-    상투어 태그·특수문자·조사·불용어를 정제하여 CLEAN_TITLE을 반환합니다.
-    """
-    if not isinstance(text, str) or not text.strip():
-        return ""
-
-    tag_pattern = (
-        r"[\[\(\<【]\s*(?:종합|단독|속보|포토|사진|영상|일문일답|전문|사설|칼럼|브리핑|"
-        r"현장|르포|인터뷰|기획|긴급|뉴스|그래픽|카드뉴스|팩트체크|이슈)[0-9보\s]*[\]\)\>】]"
-    )
-    text = re.sub(tag_pattern, " ", text)
-    text = re.sub(r"(\d+)\s*日", r"\1일", text)
-
-    for pattern, replacement in CONTEXTUAL_HANJA_PATTERNS:
-        text = re.sub(pattern, replacement, text)
-
-    for hanja, full_word in SEMANTIC_HANJA_DICT.items():
-        text = re.sub(hanja + r"(?=[은는이가을를의에로과와도만]\b)", full_word.strip(), text)
-        text = text.replace(hanja, full_word)
-
-    text = text.translate(PHONETIC_HANJA_TRANS)
-    text = re.sub(r"[^가-힣a-zA-Z0-9\s]", " ", text)
-
-    words = text.split()
-    cleaned_words: list[str] = []
-    for w in words:
-        if w in STOPWORDS:
-            continue
-        if len(w) >= 3:
-            w_stem = re.sub(
-                r"(에서|으로|에게|부터|까지|이랑|라는|에는|이라|라고|은|는|이|가|을|를|의|에|로|과|와|도|만)$",
-                "",
-                w,
-            )
-            if len(w_stem) >= 2:
-                w = w_stem
-        if w not in STOPWORDS and len(w) >= 2:
-            cleaned_words.append(w)
-
-    return " ".join(cleaned_words)
-
-
-def mask_sensitive_info(text: str) -> str:
-    """기자 이메일 및 연락처 등 개인정보를 정규식으로 마스킹합니다."""
-    text = EMAIL_RE.sub("[EMAIL]", text)
-    text = PHONE_RE.sub("[PHONE]", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def extract_press_name(url: str, content: str) -> str:
-    """네이버 뉴스 URL의 OID 또는 기사 본문 바이라인에서 신문사명을 추출합니다."""
-    m = re.search(r"/article/(\d{3})/", url or "")
-    if m and m.group(1) in OID_TO_PRESS:
-        return OID_TO_PRESS[m.group(1)]
-
-    byline = re.search(r"[\[\(]([가-힣A-Za-z0-9]{2,10}?)(?:=|\s+[가-힣]{2,4}\s*기자)", content or "")
-    if byline:
-        cand = byline.group(1).strip()
-        if cand not in {"서울", "세종", "부산", "대구", "광주", "대전", "울산", "인천", "고양", "워싱턴", "도쿄", "베이징"}:
-            return cand
-
-    if m:
-        return f"언론사({m.group(1)})"
-    return "네이버뉴스"
-
-
-def extract_keywords(text: str) -> list[str]:
-    """한국어 조사 어미를 제거하고 핵심 검색 키워드를 추출합니다."""
-    cleaned_title = preprocess_title(text)
-    raw_tokens = TOKEN_RE.findall(f"{cleaned_title} {text}")
-    keywords: list[str] = []
-    for tok in raw_tokens:
-        if tok in STOPWORDS:
-            continue
-        cleaned = re.sub(
-            r"(에서|으로|에게|부터|까지|이랑|라는|에는|은|는|이|가|을|를|에|의|로|과|와|도|만)$",
-            "",
-            tok,
-        )
-        if len(cleaned) >= 2 and cleaned not in STOPWORDS:
-            keywords.append(cleaned)
-        elif len(tok) >= 2 and tok not in STOPWORDS:
-            keywords.append(tok)
-
-    seen: set[str] = set()
-    unique: list[str] = []
-    for k in keywords:
-        if k not in seen:
-            seen.add(k)
-            unique.append(k)
-    return unique
-
-
-def text_to_vector(text: str, dim: int = TITLE_VEC_DIM) -> np.ndarray:
-    """
-    CLEAN_TITLE 또는 검색 질의를 단어 + 음절 바이그램/트라이그램 Feature Hashing 기반
-    L2 정규화 float32 임베딩 벡터(dim=512)로 고속 변환합니다.
-    """
-    vec = np.zeros(dim, dtype=np.float32)
-    clean = preprocess_title(text) or text
-    tokens = TOKEN_RE.findall(clean)
-    if not tokens:
-        tokens = TOKEN_RE.findall(text)
-
-    features: list[tuple[str, float]] = []
-    for tok in tokens:
-        features.append((f"w:{tok}", 2.2))
-        for n in (2, 3):
-            if len(tok) >= n:
-                for i in range(len(tok) - n + 1):
-                    features.append((f"c{n}:{tok[i:i+n]}", 1.0))
-
-    for feat, weight in features:
-        h = int(hashlib.md5(feat.encode("utf-8")).hexdigest()[:8], 16)
-        idx = h % dim
-        sign = 1.0 if ((h >> 8) & 1) == 0 else -1.0
-        vec[idx] += sign * weight
-
-    norm = float(np.linalg.norm(vec))
-    if norm > 0:
-        vec /= norm
-    return vec
-
-
-def serialize_vec(vec: np.ndarray) -> bytes:
-    """numpy float32 배열을 sqlite-vec 호환 직렬화 BLOB으로 변환합니다."""
-    return sqlite_vec.serialize_float32(vec.astype(np.float32).tolist())
-
-
-def parse_naver_article_html(raw_html: str) -> tuple[str, str]:
-    """네이버 뉴스 기사 HTML에서 제목(h2#title_area)과 본문(article#dic_area)을 추출합니다."""
-    title_m = re.search(r'<h2[^>]*id=["\']title_area["\'][^>]*>(.*?)</h2>', raw_html, re.S)
-    if not title_m:
-        title_m = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', raw_html, re.S)
-    title = html.unescape(re.sub(r"<[^>]+>", "", title_m.group(1))).strip() if title_m else ""
-
-    art_m = re.search(r'<article[^>]*id=["\']dic_area["\'][^>]*>(.*?)</article>', raw_html, re.S)
-    if not art_m:
-        art_m = re.search(r'<div[^>]*id=["\']newsct_article["\'][^>]*>(.*?)</div>\s*</div>', raw_html, re.S)
-    if art_m:
-        body_html = re.sub(
-            r"<(script|style|span[^>]*class=[\"']end_photo_org[\"'])[^>]*>.*?</\1>",
-            " ",
-            art_m.group(1),
-            flags=re.S,
-        )
-        body = html.unescape(re.sub(r"<[^>]+>", " ", body_html))
-        body = re.sub(r"\s+", " ", body).strip()
-    else:
-        body = ""
-    return title, body
-
-
 class RetrievedArticle(BaseModel):
     news_pk: int
     press: str
@@ -441,31 +107,11 @@ class RetrievedArticle(BaseModel):
     title_vec_sim: float = 0.0
 
 
-class PressItemSchema(BaseModel):
-    name: str = Field(description="신문사·언론사 이름")
-    title: str = Field(description="원문 기사 제목")
-    url: str = Field(default="#source", description="원문 기사 링크 URL")
-
-
-class ComparisonOutputSchema(BaseModel):
-    headline: str = Field(description="관련 기사들을 하나로 묶은 통합 뉴스 헤드라인 (1문장)")
-    summary: str = Field(description="수집된 기사들의 공통 사실관계(팩트) 종합 요약 (2~3문장)")
-    points: list[str] = Field(description="공통 핵심 팩트 및 신문사별 해석 차이 요약 3개")
-    claim1Title: str = Field(description="관점 A(주장 1)의 핵심 한 줄 제목")
-    claim1Summary: str = Field(description="관점 A(주장 1) 신문사들의 해석과 핵심 논거 요약 (2~3문장)")
-    claim1Points: list[str] = Field(description="관점 A 신문사별 구체적 의견·해석 요지 2~3개")
-    claim1Press: list[PressItemSchema] = Field(description="관점 A를 보도한 신문사 및 원문 기사 목록")
-    claim2Title: str = Field(description="관점 B(주장 2)의 핵심 한 줄 제목")
-    claim2Summary: str = Field(description="관점 B(주장 2) 신문사들의 해석과 핵심 논거 요약 (2~3문장)")
-    claim2Points: list[str] = Field(description="관점 B 신문사별 구체적 의견·해석 요지 2~3개")
-    claim2Press: list[PressItemSchema] = Field(description="관점 B를 보도한 신문사 및 원문 기사 목록")
-
-
 class NewsDBRAG:
     """
     news.db (SQLite + sqlite-vec 확장) 기반:
     - NEWS.CLEAN_TITLE -> NEWS.title_vec 벡터화 및 VEC_NEWS_TITLE(vec0) 고속 색인
-    - title_vec 기반 6대 뉴스 카테고리 분류 & KMeans(k=20) 이슈 클러스터 분류
+    - title_vec 기반 6대 뉴스 카테고리 분류 & KMeans(k=54) 이슈 클러스터 분류
     - 하이브리드 RAG 검색 및 실시간 주제 크롤러
     """
 
@@ -588,7 +234,7 @@ class NewsDBRAG:
                 self.last_index_elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
                 return vec_table_cnt
 
-            # 2. 전체 NEWS 로드 후 CLEAN_TITLE 기반으로 title_vec 고속 벡터화 (긴 본문 대신 CLEAN_TITLE만 벡터화하여 색인 속도 대폭 향상)
+            # 2. 전체 NEWS 로드 후 CLEAN_TITLE 기반으로 title_vec 고속 벡터화
             rows = cur.execute(
                 """
                 SELECT N.PK, COALESCE(L.URL, ''), N.TITLE, COALESCE(N.CLEAN_TITLE, ''), N.CONTENT, COALESCE(N.REGDATE, '')
@@ -618,7 +264,7 @@ class NewsDBRAG:
                 vec_blobs.append(t_blob)
                 categories.append(cat)
 
-            # 3. preprocessing.ipynb의 기준 C (실루엣 k=88과 엘보우 k=20의 평균 k=54) 방식으로 CLEAN_TITLE / title_vec 기반 이슈 클러스터 분류
+            # 3. preprocessing.ipynb 기준 C (k=54) 방식으로 CLEAN_TITLE / title_vec 기반 이슈 클러스터 분류
             cluster_ids, cluster_labels = self._compute_issue_clusters(clean_titles, vecs_list, n_clusters=54)
 
             # 4. NEWS 테이블에 CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL 일괄 업데이트
@@ -642,7 +288,7 @@ class NewsDBRAG:
                 [(pks[i], vec_blobs[i]) for i in range(len(pks))],
             )
 
-            # 6. RAG_INDEX 테이블 동기화 (EMBEDDING에도 고속 생성된 title_vec + 핵심 요약 벡터 저장)
+            # 6. RAG_INDEX 테이블 동기화
             seen_titles: set[str] = set()
             rag_to_insert: list[tuple[Any, ...]] = []
             for idx, (pk, url, raw_title, _db_clean, content, regdate) in enumerate(rows):
@@ -699,7 +345,7 @@ class NewsDBRAG:
     ) -> tuple[list[int], list[str]]:
         """
         CLEAN_TITLE 및 title_vec을 기반으로 뉴스 기사들을 k개 이슈 클러스터로 자동 분류하고
-        각 클러스터의 대표 키워드 3개로 라벨(예: 'C3: 대통령, 이재명, 국무회의')을 부여합니다.
+        각 클러스터의 대표 키워드 3개로 라벨(예: 'C03: 대통령, 이재명, 국무회의')을 부여합니다.
         """
         if not clean_titles:
             return [], []
@@ -733,7 +379,6 @@ class NewsDBRAG:
             c_labels = [label_map[cid] for cid in c_ids]
             return c_ids, c_labels
         except Exception:
-            # 폴백: title_vec 기반 경량 군집화
             mat = np.vstack(vecs_list)
             step = max(1, len(vecs_list) // k)
             centers = mat[::step][:k]
@@ -844,7 +489,7 @@ class NewsDBRAG:
                 )
                 link_pk = cur.lastrowid
 
-                # 2. NEWS 테이블 저장 (CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL 포함)
+                # 2. NEWS 테이블 저장
                 cur.execute(
                     """
                     INSERT INTO NEWS(FK, TITLE, CONTENT, CLEAN_TITLE, title_vec, CATEGORY, CLUSTER_ID, CLUSTER_LABEL)
@@ -929,7 +574,6 @@ class NewsDBRAG:
 
         with connect_vec_db(self.db_path) as con:
             cur = con.cursor()
-            # sqlite-vec C 확장 함수 vec_distance_cosine(title_vec, ?)으로 SQLite 내부에서 즉시 유사도 산출
             rows = cur.execute(
                 """
                 SELECT
@@ -1045,7 +689,6 @@ class NewsDBRAG:
 
         with connect_vec_db(self.db_path) as con:
             cur = con.cursor()
-            # sqlite-vec VEC_NEWS_TITLE 가상 테이블에서 MATCH 연산자로 초고속 KNN 검색
             knn_rows = cur.execute(
                 """
                 SELECT
@@ -1086,7 +729,6 @@ class NewsDBRAG:
                     }
                 )
 
-        # 최근접 이웃(KNN) 다수결 카테고리와 프로토타입 점수를 결합하여 분류 정밀도 향상
         if neighbor_cats and similar_articles and similar_articles[0]["similarity"] >= 55.0:
             from collections import Counter
 
@@ -1159,7 +801,7 @@ class NewsDBRAG:
                     }
                 )
 
-            # 2. 상위 이슈 클러스터(CLEAN_TITLE + title_vec 군집) 집계 (단일/일반 잡음 군집 제외)
+            # 2. 상위 이슈 클러스터 집계
             cluster_rows = cur.execute(
                 """
                 SELECT
@@ -1281,385 +923,11 @@ class NewsDBRAG:
         return results[:limit]
 
 
-# =====================================================================
-# LangGraph 에이전트 상태 및 노드 정의
-# =====================================================================
-
-
-class AgentState(TypedDict, total=False):
-    query: str
-    thread_id: str
-    keywords: list[str]
-    articles: list[dict[str, Any]]
-    crawled_count: int
-    is_sufficient: bool
-    result: dict[str, Any]
-
-
-def _split_sentences(text: str) -> list[str]:
-    """기사 본문에서 핵심 문장들을 분리합니다."""
-    cleaned = re.sub(r"\[[^\]]{2,30}\]", " ", text)
-    cleaned = re.sub(r"\([^\)]{2,25}=[^\)]{2,25}\)", " ", cleaned)
-    raw = re.split(r"(?<=[.?!다])\s+", cleaned)
-    sents = []
-    for s in raw:
-        s = s.strip()
-        if 28 <= len(s) <= 220 and not s.endswith("기자"):
-            sents.append(s)
-    return sents
-
-
-def _summarize_press_opinion(art: RetrievedArticle) -> str:
-    """각 신문사 기사의 핵심 해석/의견 1문장을 추출합니다 (노트북 SLM 요약본이 있으면 우선 활용)."""
-    if art.summary and art.summary.strip():
-        return art.summary.strip()
-    sents = _split_sentences(art.content)
-    for s in sents:
-        if any(cue in s for cue in ('"', "“", "'", "우려", "지적", "강조", "평가", "풀이", "전망", "비판", "필요")):
-            return s
-    return sents[0] if sents else art.title
-
-
-def _extractive_compare_articles(
-    query: str,
-    articles: list[RetrievedArticle],
-    crawled_count: int = 0,
-) -> dict[str, Any]:
-    """
-    관련 기사들을 하나의 통합 헤드라인으로 묶어 요약하고,
-    title_vec 의미 벡터 거리 기준으로 가장 대비되는 두 관점(관점 A vs 관점 B)으로 분류하여 비교합니다.
-    """
-    press_set = sorted({a.press for a in articles})
-    top_art = articles[0]
-
-    if len(articles) >= 2:
-        vecs = [text_to_vector(f"{a.clean_title or a.title} {a.content[:400]}") for a in articles]
-        max_dist = -1.0
-        seed_a, seed_b = 0, 1
-        for i in range(len(articles)):
-            for j in range(i + 1, len(articles)):
-                dist = 1.0 - float(np.dot(vecs[i], vecs[j]))
-                if dist > max_dist:
-                    max_dist = dist
-                    seed_a, seed_b = i, j
-
-        group1: list[RetrievedArticle] = [articles[seed_a]]
-        group2: list[RetrievedArticle] = [articles[seed_b]]
-        for idx, art in enumerate(articles):
-            if idx in (seed_a, seed_b):
-                continue
-            sim_a = float(np.dot(vecs[idx], vecs[seed_a]))
-            sim_b = float(np.dot(vecs[idx], vecs[seed_b]))
-            if sim_a >= sim_b:
-                group1.append(art)
-            else:
-                group2.append(art)
-    else:
-        group1 = list(articles)
-        group2 = list(articles)
-
-    g1_press_names = "·".join(dict.fromkeys(a.press for a in group1[:3]))
-    g2_press_names = "·".join(dict.fromkeys(a.press for a in group2[:3]))
-    unified_headline = (
-        f"[{query}] {top_art.title}… "
-        f"{g1_press_names} 등 {len(press_set)}개 신문사별 해석·관점 종합"
-    )
-
-    lead_sents: list[str] = []
-    for art in articles[:3]:
-        sents = _split_sentences(art.content)
-        if sents and sents[0] not in lead_sents:
-            lead_sents.append(sents[0])
-    common_summary = " ".join(lead_sents[:2]) if lead_sents else top_art.content[:280]
-
-    common_points = [
-        f"<strong>공통 보도 팩트:</strong> {len(press_set)}개 신문사({', '.join(press_set[:6])})가 ‘{query}’ 사안을 주요 의제로 보도 (분류: {top_art.category})",
-        f"<strong>관점 A ({g1_press_names} 등):</strong> {group1[0].title} 중심 해석",
-        f"<strong>관점 B ({g2_press_names} 등):</strong> {group2[0].title} 중심 해석",
-    ]
-
-    g1_opinions = [_summarize_press_opinion(a) for a in group1[:2]]
-    claim1_summary = " ".join(g1_opinions) if g1_opinions else group1[0].content[:220]
-    claim1_points = [
-        f"<strong>[{a.press}]</strong> {_summarize_press_opinion(a)[:110]}"
-        for a in group1[:3]
-    ]
-    claim1_press = [{"name": a.press, "title": a.title, "url": a.url} for a in group1[:4]]
-
-    g2_opinions = [_summarize_press_opinion(a) for a in group2[:2]]
-    claim2_summary = " ".join(g2_opinions) if g2_opinions else group2[0].content[:220]
-    claim2_points = [
-        f"<strong>[{a.press}]</strong> {_summarize_press_opinion(a)[:110]}"
-        for a in group2[:3]
-    ]
-    claim2_press = [{"name": a.press, "title": a.title, "url": a.url} for a in group2[:4]]
-
-    crawl_note = f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
-
-    return {
-        "headline": unified_headline,
-        "meta": [
-            f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
-            f"벡터 색인: sqlite-vec (title_vec 최고 유사도 {top_art.score:.2f} · 분류: {top_art.category})",
-            "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
-        ],
-        "summary": common_summary,
-        "points": common_points,
-        "claim1Title": f"[{g1_press_names}] {group1[0].title}",
-        "claim1Summary": claim1_summary,
-        "claim1Points": claim1_points,
-        "claim1Press": claim1_press,
-        "claim2Title": f"[{g2_press_names}] {group2[0].title}",
-        "claim2Summary": claim2_summary,
-        "claim2Points": claim2_points,
-        "claim2Press": claim2_press,
-    }
-
-
-class NewsLensAgent:
-    """
-    A2 문제 정의 + sqlite-vec (title_vec) 고속 검색·분류 에이전트:
-    1) 주제에 대한 DB(news.db) title_vec 기반 고속 검색
-    2) DB 내 신문사별 기사가 부족하면 실시간 크롤링 도구로 긁어와 news.db에 저장 및 벡터 색인
-    3) 하나의 헤드라인으로 묶어 공통 요약 + 신문사별 의견(관점 A vs 관점 B) 비교
-    """
-
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
-        self.rag = NewsDBRAG(db_path=db_path)
-        self._memory_store: dict[str, list[dict[str, Any]]] = {}
-        self.graph = self._build_graph()
-
-    def _build_graph(self):
-        from langgraph.graph import END, START, StateGraph
-
-        builder = StateGraph(AgentState)
-        builder.add_node("analyze_query", self.analyze_query_node)
-        builder.add_node("retrieve_news", self.retrieve_news_node)
-        builder.add_node("crawl_topic_to_db", self.crawl_topic_to_db_node)
-        builder.add_node("compare_and_summarize", self.compare_and_summarize_node)
-        builder.add_node("reject_no_evidence", self.reject_no_evidence_node)
-        builder.add_node("verify_sources", self.verify_sources_node)
-
-        builder.add_edge(START, "analyze_query")
-        builder.add_edge("analyze_query", "retrieve_news")
-
-        builder.add_conditional_edges(
-            "retrieve_news",
-            self.decide_crawl_or_compare,
-            {
-                "compare": "compare_and_summarize",
-                "crawl": "crawl_topic_to_db",
-            },
-        )
-
-        builder.add_conditional_edges(
-            "crawl_topic_to_db",
-            self.route_after_crawl,
-            {
-                "sufficient": "compare_and_summarize",
-                "insufficient": "reject_no_evidence",
-            },
-        )
-
-        builder.add_edge("compare_and_summarize", "verify_sources")
-        builder.add_edge("verify_sources", END)
-        builder.add_edge("reject_no_evidence", END)
-
-        return builder.compile()
-
-    def analyze_query_node(self, state: AgentState) -> AgentState:
-        """질문에서 핵심 키워드를 추출하고 이전 대화 맥락(후속 질문)을 결합합니다."""
-        query = (state.get("query") or "").strip()
-        thread_id = state.get("thread_id") or "default-session"
-        history = self._memory_store.get(thread_id, [])
-
-        if history and any(cue in query for cue in ("방금", "그중", "이전", "위에서", "더 자세히")):
-            prev_query = history[-1].get("query", "")
-            combined_query = f"{prev_query} {query}"
-        else:
-            combined_query = query
-
-        keywords = extract_keywords(combined_query)
-        return {
-            "query": query,
-            "thread_id": thread_id,
-            "keywords": keywords,
-            "crawled_count": 0,
-        }
-
-    def retrieve_news_node(self, state: AgentState) -> AgentState:
-        """news.db에서 sqlite-vec title_vec 기반 하이브리드 RAG 검색을 수행합니다."""
-        search_text = " ".join(state.get("keywords") or []) or state.get("query", "")
-        articles = self.rag.retrieve(search_text, top_k=8, min_score=0.28, diversify_press=True)
-        distinct_press = {a.press for a in articles}
-        top_score = articles[0].score if articles else 0.0
-        return {
-            "articles": [a.model_dump() for a in articles],
-            "is_sufficient": len(articles) >= 2 and len(distinct_press) >= 2 and top_score >= 0.35,
-        }
-
-    def decide_crawl_or_compare(self, state: AgentState) -> Literal["compare", "crawl"]:
-        """
-        news.db에 이미 유사도 0.40 이상의 고연관 기사가 3개 이상 신문사에서 확보되어 있으면 즉시 비교·요약하고,
-        부족하면 실시간으로 해당 주제의 기사들을 긁어와 news.db에 저장하는 크롤링 도구를 선택합니다.
-        """
-        raw_articles = state.get("articles") or []
-        strong_articles = [a for a in raw_articles if a.get("score", 0.0) >= 0.40]
-        distinct_press = {a["press"] for a in strong_articles}
-        if len(strong_articles) >= 3 and len(distinct_press) >= 3:
-            return "compare"
-        return "crawl"
-
-    def crawl_topic_to_db_node(self, state: AgentState) -> AgentState:
-        """주제에 대한 기사들을 실시간으로 긁어와 news.db에 저장 및 title_vec 색인 후 재검색합니다."""
-        search_text = " ".join(state.get("keywords") or []) or state.get("query", "")
-        added = self.rag.crawl_topic_and_save_to_db(search_text, max_articles=8)
-        articles = self.rag.retrieve(search_text, top_k=8, min_score=0.28, diversify_press=True)
-        distinct_press = {a.press for a in articles}
-        top_score = articles[0].score if articles else 0.0
-        return {
-            "crawled_count": added,
-            "articles": [a.model_dump() for a in articles],
-            "is_sufficient": len(articles) >= 2 and len(distinct_press) >= 2 and top_score >= 0.35,
-        }
-
-    def route_after_crawl(self, state: AgentState) -> Literal["sufficient", "insufficient"]:
-        """크롤링 및 재검색 후에도 관련 기사가 2건 미만이면 근거 부족 안내로 분기합니다."""
-        return "sufficient" if state.get("is_sufficient") else "insufficient"
-
-    def reject_no_evidence_node(self, state: AgentState) -> AgentState:
-        """없는 자료 가져오지 않기(환각 차단): DB 검색 및 실시간 크롤링에서도 기사가 없을 때 안내합니다."""
-        q = state.get("query", "")
-        popular = self.rag.get_popular_issues(limit=4)
-        suggested = ", ".join(f"‘{p['query']}’" for p in popular) if popular else "‘김여정 확성기’, ‘수사기관장 배석’, ‘국민연금’"
-        return {
-            "result": {
-                "headline": f"‘{q}’에 대한 보도 기사를 찾을 수 없습니다",
-                "meta": [
-                    "수집 출처: news.db (sqlite-vec) 검색 + 실시간 크롤링 결과 0건",
-                    "환각 방지(성공 기준 1): 근거 없는 추측·가짜 출처 생성 차단됨",
-                    f"추천 주제: {suggested}",
-                ],
-                "summary": (
-                    f"로컬 데이터베이스(news.db) sqlite-vec 벡터 검색 및 실시간 뉴스 크롤링을 모두 수행했으나 ‘{q}’ 주제와 일치하는 "
-                    f"신뢰할 수 있는 보도 기사가 확인되지 않았습니다. 에이전트 안전 설계에 따라 없는 자료를 지어내지 않습니다."
-                ),
-                "points": [
-                    "<strong>환각 차단 완료:</strong> 근거 기사가 부족하여 추측성 요약 생성을 중단했습니다.",
-                    f"<strong>추천 검색 주제:</strong> {suggested}",
-                ],
-                "claim1Title": "근거 기사 없음 (비교 생략)",
-                "claim1Summary": "비교 가능한 신문사 기사가 부족하여 관점 A 요약을 생성하지 않았습니다.",
-                "claim1Points": ["news.db 내 일치 기사 부족"],
-                "claim1Press": [],
-                "claim2Title": "근거 기사 없음 (비교 생략)",
-                "claim2Summary": "비교 가능한 신문사 기사가 부족하여 관점 B 요약을 생성하지 않았습니다.",
-                "claim2Points": ["news.db 내 일치 기사 부족"],
-                "claim2Press": [],
-                "articles": [],
-            }
-        }
-
-    def compare_and_summarize_node(self, state: AgentState) -> AgentState:
-        """검색·수집된 news.db 기사들을 하나의 헤드라인으로 묶어 요약하고 신문사별로 의견을 비교합니다."""
-        query = state.get("query", "")
-        raw_articles = state.get("articles") or []
-        crawled_count = state.get("crawled_count") or 0
-        articles = [RetrievedArticle(**a) for a in raw_articles]
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if api_key:
-            try:
-                from langchain_anthropic import ChatAnthropic
-
-                llm = ChatAnthropic(
-                    model=os.environ.get("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
-                    api_key=api_key,
-                    temperature=0.1,
-                    max_tokens=2048,
-                )
-                structured_llm = llm.with_structured_output(ComparisonOutputSchema)
-
-                context_blocks = []
-                for idx, a in enumerate(articles, 1):
-                    context_blocks.append(
-                        f"[기사 {idx}]\n"
-                        f"- 신문사: {a.press}\n"
-                        f"- 분류: {a.category} ({a.cluster_label})\n"
-                        f"- 제목: {a.title}\n"
-                        f"- URL: {a.url}\n"
-                        f"- 본문 발췌: {a.content[:700]}"
-                    )
-                context_text = "\n\n".join(context_blocks)
-
-                prompt = (
-                    "당신은 여러 신문사의 기사를 하나의 헤드라인으로 묶어 요약하고 신문사별 해석·의견 차이를 비교해 주는 AI 에이전트입니다.\n"
-                    "반드시 아래 제공된 [news.db 기사 목록]만을 근거로 삼아 답하세요.\n"
-                    "원문에 없는 사실이나 목록에 없는 신문사·URL을 절대 지어내지 마세요.\n"
-                    "claim1Points와 claim2Points에는 '<strong>[신문사명]</strong> 핵심 해석 요지' 형식으로 신문사별 의견을 명확히 비교해 주세요.\n\n"
-                    f"[사용자 주제/질문]\n{query}\n\n"
-                    f"[news.db 기사 목록]\n{context_text}"
-                )
-
-                parsed: ComparisonOutputSchema = structured_llm.invoke(prompt)
-                press_set = sorted({a.press for a in articles})
-                crawl_note = f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
-                out = parsed.model_dump()
-                out["meta"] = [
-                    f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
-                    "분석 모델: Anthropic Claude (LangGraph + sqlite-vec RAG)",
-                    "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
-                ]
-                return {"result": out}
-            except Exception as e:
-                print(f"[안내] Anthropic API 호출 실패({e}) -> news.db 추출형 비교 엔진으로 대체합니다.")
-
-        return {"result": _extractive_compare_articles(query, articles, crawled_count=crawled_count)}
-
-    def verify_sources_node(self, state: AgentState) -> AgentState:
-        """모든 신문사 출처 URL이 실제 news.db 검색 기사에 존재하는지 검증합니다."""
-        result = dict(state.get("result") or {})
-        raw_articles = state.get("articles") or []
-        valid_by_press = {a["press"]: a for a in raw_articles}
-        valid_urls = {a["url"] for a in raw_articles if a.get("url")}
-
-        for key in ("claim1Press", "claim2Press"):
-            verified_list = []
-            for item in result.get(key, []):
-                url = item.get("url", "")
-                name = item.get("name", "")
-                title = item.get("title", "")
-                if url in valid_urls:
-                    verified_list.append(item)
-                elif name in valid_by_press:
-                    matched = valid_by_press[name]
-                    verified_list.append(
-                        {"name": matched["press"], "title": title or matched["title"], "url": matched["url"]}
-                    )
-            result[key] = verified_list
-
-        result["articles"] = raw_articles
-        thread_id = state.get("thread_id") or "default-session"
-        history = self._memory_store.setdefault(thread_id, [])
-        history.append({"query": state.get("query", ""), "headline": result.get("headline", "")})
-        if len(history) > 5:
-            del history[:-5]
-
-        return {"result": result}
-
-    def run(self, query: str, thread_id: str = "default-session") -> dict[str, Any]:
-        """주제/질문을 입력받아 [sqlite-vec 검색 -> 부족 시 크롤링·DB저장 -> 헤드라인 통합 요약 -> 신문사별 의견 비교]를 수행합니다."""
-        final_state = self.graph.invoke({"query": query, "thread_id": thread_id})
-        return final_state["result"]
-
-
-agent = NewsLensAgent()
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.stdout.reconfigure(encoding="utf-8")
-    test_query = sys.argv[1] if len(sys.argv) > 1 else "수사기관장 배석 사법개혁"
-    res = agent.run(test_query)
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+__all__ = [
+    "ROOT_DIR",
+    "DEFAULT_DB_PATH",
+    "NEWS_CATEGORY_SPECS",
+    "connect_vec_db",
+    "RetrievedArticle",
+    "NewsDBRAG",
+]

@@ -1,733 +1,48 @@
 """
-summary.py - 노트북 4GB VRAM GPU 기반 로컬 SLM 뉴스 요약기 & Render($0 요금제) 웹서비스 제공 서버
+summary.py - 노트북 4GB VRAM GPU 기반 로컬 SLM 뉴스 요약기 대시보드, REST API, OpenAI 프록시 서버 & CLI 런처
 
-[핵심 역할]
-1. news.db의 NEWS 테이블에서 CONTENT를 읽어와 로컬 SLM
-   (kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF)으로 한국어 핵심 요약 생성
-2. VRAM 4GB GPU(예: GTX 1650 Ti 4096MB) 환경에 맞춘 메모리 최적화 구동:
-   - Unsloth llama-server.exe 또는 로컬 OpenAI 호환 서버(127.0.0.1:8889) 자동 연동·자동 실행
-   - 컨텍스트 길이 제한(-c 2048), KV 캐시 8비트 양자화(-ctk q8_0 -ctv q8_0), 단일 병렬 슬롯(--parallel 1)으로
-     2.22GB Q8_0 모델을 4GB VRAM 안에서 OOM 없이 100% GPU 가속 실행
-3. 요약 결과를 news.db (NEWS.SUMMARY 및 RAG_INDEX.SUMMARY)에 저장하고 웹서비스에 제공:
-   - [모드 A: 배치 요약 + Render 전송] 로컬 DB 요약 저장 후 Render($0) 웹서비스(/api/receive-summaries)로 Push
-   - [모드 B: 요약 API & 대시보드 서버] 웹서비스가 호출할 수 있는 REST API(/api/summaries, /api/summarize) 및
-     OpenAI 호환 엔드포인트(/v1/chat/completions) 제공
-
-[실행 예시]
-- 기본 실행 (미요약 기사 10건 우선 요약 후 요약 제공 웹서버 기동):
-    python summary.py
-- 배치 요약만 실행 (예: 30건 요약 후 종료):
-    python summary.py --mode batch --limit 30
-- 요약 후 Render 웹서비스로 자동 Push:
-    python summary.py --mode batch --limit 20 --render-url https://내서비스.onrender.com
-- 요약 제공 API 서버만 즉시 실행 (기본 포트 8001):
-    python summary.py --mode serve --port 8001
+[모듈 분리 및 리팩토링 내역]
+1. preprocessing.py  : clean_article_content() (이메일·전화번호·저작권 문구 제거 및 컨텍스트 길이 조절)
+2. slm_server.py     : find_local_gguf_path(), find_llama_server_exe(), start_optimized_llama_server()
+3. summary_engine.py : connect_summary_db() (timeout=15.0 + WAL 모드), ensure_summary_columns(),
+                       LocalKananaSummarizer (summarize_text, summarize_batch, push_summaries_to_render)
+4. summary.py        : create_summary_app() (웹 대시보드, 요약 API, OpenAI 호환 프록시) 및 main() CLI 진입점
+   - 모듈 임포트 시 전역 `app = create_summary_app()`이 즉시 실행되어 `LocalKananaSummarizer`가 두 번 생성되던 문제를
+     지연 초기화(`get_summary_app()` / 모듈 `__getattr__`)로 해결했습니다.
 """
 
 from __future__ import annotations
 
 import argparse
-import atexit
-from datetime import datetime
 import json
 import os
-from pathlib import Path
-import re
-import sqlite3
-import subprocess
 import sys
 import time
 from typing import Any
-import urllib.error
-import urllib.request
 
-from dotenv import load_dotenv
-import httpx
+from preprocessing import clean_article_content
+from rag import DEFAULT_DB_PATH, ROOT_DIR
+from slm_server import (
+    DEFAULT_API_KEY,
+    DEFAULT_GGUF_FILENAME,
+    DEFAULT_LLAMA_BASE_URL,
+    DEFAULT_LLAMA_SERVER_PORT,
+    DEFAULT_MODEL_REPO,
+    find_free_port,
+    find_llama_server_exe,
+    find_local_gguf_path,
+    probe_openai_models_url,
+    start_optimized_llama_server,
+)
+from summary_engine import (
+    DEFAULT_RENDER_URL,
+    SUMMARY_SYNC_TOKEN,
+    LocalKananaSummarizer,
+    connect_summary_db,
+    ensure_summary_columns,
+)
 
-ROOT_DIR = Path(__file__).resolve().parent
-ENV_FILE = ROOT_DIR / ".env"
-DEFAULT_DB_PATH = ROOT_DIR / "news.db"
-
-if ENV_FILE.exists():
-    load_dotenv(ENV_FILE)
-
-# 기본 모델 및 로컬 SLM 서버 설정 (유료 OpenAI API가 아닌 로컬 Unsloth / llama-server 전용)
-DEFAULT_MODEL_REPO = os.environ.get("UNSLOTH_MODEL", "kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF").strip()
-DEFAULT_GGUF_FILENAME = "kanana-nano-2.1b-instruct-q8_0.gguf"
-DEFAULT_LLAMA_SERVER_PORT = 8891
-DEFAULT_LLAMA_BASE_URL = f"http://127.0.0.1:{DEFAULT_LLAMA_SERVER_PORT}/v1"
-DEFAULT_API_KEY = os.environ.get(
-    "UNSLOTH_API_KEY",
-    "sk-unsloth-f65f99d826c89c73362ddeb617e7963e",
-).strip()
 DEFAULT_SUMMARY_PORT = int(os.environ.get("SUMMARY_PORT", "8001"))
-DEFAULT_RENDER_URL = os.environ.get("RENDER_SERVICE_URL", "").strip()
-SUMMARY_SYNC_TOKEN = os.environ.get("SUMMARY_SYNC_TOKEN", "").strip()
-
-EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
-PHONE_RE = re.compile(r"\b0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}\b")
-
-
-def clean_article_content(content: str, max_chars: int = 1600) -> str:
-    """
-    NEWS.CONTENT에서 기자 이메일, 연락처, 저작권 문구, 과도한 공백을 제거하고
-    4GB VRAM 컨텍스트(2048 토큰)에 맞게 핵심 본문 길이를 조절합니다.
-    """
-    if not content:
-        return ""
-    text = EMAIL_RE.sub("", content)
-    text = PHONE_RE.sub("", text)
-    # 불필요한 언론사 저작권/무단전재 문구 제거
-    text = re.sub(r"무단\s*전재\s*(및\s*재배포\s*금지|금지).*$", "", text)
-    text = re.sub(r"ⓒ\s*[^\n]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rsplit(" ", 1)[0] + "..."
-    return text
-
-
-def ensure_summary_columns(db_path: str | Path = DEFAULT_DB_PATH) -> None:
-    """
-    news.db의 NEWS 테이블과 RAG_INDEX 테이블에 SUMMARY, SUMMARY_MODEL, SUMMARY_AT 컬럼을 보장합니다.
-    """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        raise FileNotFoundError(f"news.db 파일을 찾을 수 없습니다: {db_path}")
-
-    with sqlite3.connect(str(db_path)) as con:
-        cur = con.cursor()
-        news_cols = {c[1] for c in cur.execute("PRAGMA table_info(NEWS)").fetchall()}
-        if "SUMMARY" not in news_cols:
-            cur.execute("ALTER TABLE NEWS ADD COLUMN SUMMARY TEXT DEFAULT ''")
-        if "SUMMARY_MODEL" not in news_cols:
-            cur.execute("ALTER TABLE NEWS ADD COLUMN SUMMARY_MODEL TEXT DEFAULT ''")
-        if "SUMMARY_AT" not in news_cols:
-            cur.execute("ALTER TABLE NEWS ADD COLUMN SUMMARY_AT TEXT DEFAULT ''")
-
-        tables = {
-            r[0]
-            for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
-        if "RAG_INDEX" in tables:
-            rag_cols = {c[1] for c in cur.execute("PRAGMA table_info(RAG_INDEX)").fetchall()}
-            if "SUMMARY" not in rag_cols:
-                cur.execute("ALTER TABLE RAG_INDEX ADD COLUMN SUMMARY TEXT NOT NULL DEFAULT ''")
-        con.commit()
-
-
-def find_local_gguf_path(repo_id: str = DEFAULT_MODEL_REPO, filename: str = DEFAULT_GGUF_FILENAME) -> Path | None:
-    """
-    로컬 HuggingFace 캐시 폴더에서 kanana-nano-2.1b-instruct-q8_0.gguf 파일 경로를 탐색하고,
-    없으면 huggingface_hub를 통해 다운로드를 시도합니다.
-    """
-    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
-    model_dir_name = "models--" + repo_id.replace("/", "--")
-    snapshots_dir = hf_cache / model_dir_name / "snapshots"
-
-    if snapshots_dir.exists():
-        for gguf_file in snapshots_dir.rglob("*.gguf"):
-            if gguf_file.is_file() and gguf_file.stat().st_size > 100_000_000:
-                return gguf_file
-
-    # 현재 작업 폴더 내부에 GGUF 파일이 있는지도 확인
-    for local_candidate in ROOT_DIR.glob("*.gguf"):
-        if "kanana" in local_candidate.name.lower():
-            return local_candidate
-
-    # 캐시에 없으면 huggingface_hub로 다운로드 시도
-    try:
-        from huggingface_hub import hf_hub_download
-
-        print(f"[모델 다운로드] HuggingFace에서 '{repo_id}/{filename}' 파일을 가져옵니다...")
-        downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
-        return Path(downloaded)
-    except Exception as e:
-        print(f"[경고] GGUF 모델 자동 다운로드 실패: {e}")
-        return None
-
-
-def find_llama_server_exe() -> Path | None:
-    """
-    노트북에 설치된 Unsloth llama.cpp의 llama-server.exe 경로를 찾습니다.
-    """
-    candidates = [
-        Path.home() / ".unsloth" / "llama.cpp" / "build" / "bin" / "Release" / "llama-server.exe",
-        Path.home() / ".unsloth" / "llama.cpp" / "build" / "bin" / "llama-server.exe",
-        Path.home() / ".unsloth" / "llama.cpp" / "llama-server.exe",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
-
-
-class LocalKananaSummarizer:
-    """
-    VRAM 4GB GPU 환경에서 kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF 모델을 구동하여
-    news.db의 기사를 요약하는 로컬 SLM 엔진입니다.
-    """
-
-    def __init__(
-        self,
-        db_path: str | Path = DEFAULT_DB_PATH,
-        model_id: str = DEFAULT_MODEL_REPO,
-        base_url: str = DEFAULT_LLAMA_BASE_URL,
-        api_key: str = DEFAULT_API_KEY,
-        n_gpu_layers: int = 99,
-        ctx_size: int = 2048,
-        auto_start_server: bool = True,
-    ) -> None:
-        self.db_path = Path(db_path)
-        self.model_id = model_id
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.n_gpu_layers = n_gpu_layers
-        self.ctx_size = ctx_size
-        self.auto_start_server = auto_start_server
-        self._llama_proc: subprocess.Popen | None = None
-
-        ensure_summary_columns(self.db_path)
-        atexit.register(self.stop_local_server)
-
-    @staticmethod
-    def _probe_openai_models_url(base_url: str, api_key: str) -> bool:
-        """
-        해당 base_url의 /models 엔드포인트가 실제 VRAM에 모델이 적재된
-        llama-server OpenAI 호환 JSON을 반환하는지 검사합니다.
-        """
-        models_url = f"{base_url.rstrip('/')}/models"
-        try:
-            req = urllib.request.Request(
-                models_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            with urllib.request.urlopen(req, timeout=2.5) as resp:
-                if resp.status != 200:
-                    return False
-                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-                    return False
-                data_list = payload["data"]
-                if not data_list:
-                    return False
-                # llama-server는 실제 모델이 메모리에 로드되어 있을 때 owned_by="llamacpp" 또는 meta 정보를 포함함
-                return any(
-                    isinstance(m, dict) and (m.get("owned_by") == "llamacpp" or "meta" in m)
-                    for m in data_list
-                )
-        except Exception:
-            return False
-
-    def is_llm_server_online(self) -> bool:
-        """
-        로컬 OpenAI 호환 SLM 추론 서버(8891, 8889 등)가 응답하는지 확인하고,
-        응답하는 로컬 포트가 있으면 self.base_url을 자동 갱신합니다.
-        """
-        candidates = [
-            self.base_url,
-            "http://127.0.0.1:8891/v1",
-            "http://127.0.0.1:8892/v1",
-        ]
-        seen: set[str] = set()
-        for cand in candidates:
-            c = cand.rstrip("/")
-            if c in seen:
-                continue
-            seen.add(c)
-            if self._probe_openai_models_url(c, self.api_key):
-                self.base_url = c
-                return True
-        return False
-
-    @staticmethod
-    def _find_free_port(preferred_ports: tuple[int, ...] = (8891, 8892, 11435)) -> int:
-        import socket
-
-        for p in preferred_ports:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                if s.connect_ex(("127.0.0.1", p)) != 0:
-                    return p
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return int(s.getsockname()[1])
-
-    def ensure_local_slm_server(self) -> bool:
-        """
-        로컬 SLM 추론 서버가 켜져 있지 않으면 비어 있는 포트를 찾아
-        4GB VRAM 최적화 파라미터로 llama-server.exe를 자동 실행합니다.
-        """
-        if self.is_llm_server_online():
-            return True
-
-        if not self.auto_start_server:
-            return False
-
-        llama_exe = find_llama_server_exe()
-        gguf_path = find_local_gguf_path()
-
-        if not llama_exe or not gguf_path:
-            print(
-                f"[안내] llama-server.exe({llama_exe}) 또는 GGUF 파일({gguf_path})을 찾을 수 없습니다.\n"
-                "       Unsloth 서버(127.0.0.1:8888 또는 8889)를 먼저 실행하거나 모델 캐시를 확인하세요."
-            )
-            return False
-
-        port = self._find_free_port()
-        target_base_url = f"http://127.0.0.1:{port}/v1"
-
-        # 4GB VRAM GPU 맞춤형 실행 인자:
-        # -ngl 99: 레이어 GPU 오프로딩 (2.22GB Q8_0 모델이 4GB VRAM에 적재됨)
-        # -c 2048: 뉴스 요약에 충분한 컨텍스트 크기로 제한하여 KV 캐시 VRAM 절약
-        # -ctk q8_0 -ctv q8_0: KV 캐시를 8비트로 양자화해 VRAM 사용량 최소화
-        # --parallel 1: 동시 슬롯 1개로 고정하여 불필요한 버퍼 할당 방지
-        for ngl_try in (self.n_gpu_layers, 20, 0):
-            cmd = [
-                str(llama_exe),
-                "-m",
-                str(gguf_path),
-                "--alias",
-                self.model_id,
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "-ngl",
-                str(ngl_try),
-                "-c",
-                str(self.ctx_size),
-                "-b",
-                "512",
-                "-ub",
-                "256",
-                "-ctk",
-                "q8_0",
-                "-ctv",
-                "q8_0",
-                "--parallel",
-                "1",
-            ]
-            print(
-                f"[SLM 서버 기동] 4GB VRAM 최적화 모드로 '{gguf_path.name}' 모델을 로드합니다 "
-                f"(port={port}, n_gpu_layers={ngl_try}, ctx={self.ctx_size})..."
-            )
-            env = os.environ.copy()
-            extra_cuda_paths = [
-                Path.home() / ".unsloth" / "studio" / "unsloth_studio" / "Lib" / "site-packages" / "torch" / "lib",
-                llama_exe.parent,
-            ]
-            existing_extra = [str(p) for p in extra_cuda_paths if p.exists()]
-            if existing_extra:
-                env["PATH"] = os.pathsep.join(existing_extra) + os.pathsep + env.get("PATH", "")
-
-            try:
-                self._llama_proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(llama_exe.parent),
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                print(f"[오류] llama-server 실행 실패: {e}")
-                return False
-
-            # 모델이 VRAM에 올라올 때까지 최대 25초 대기
-            start_wait = time.time()
-            while time.time() - start_wait < 25.0:
-                if self._llama_proc.poll() is not None:
-                    break
-                if self._probe_openai_models_url(target_base_url, self.api_key):
-                    self.base_url = target_base_url
-                    print(f"[SLM 준비 완료] {self.model_id} 서버가 {self.base_url} 에서 응답 중입니다.")
-                    return True
-                time.sleep(0.5)
-
-            print(f"[재시도] n_gpu_layers={ngl_try} 기동 실패 -> 레이어 수를 조정하여 재시도합니다.")
-            self.stop_local_server()
-
-        return False
-
-    def stop_local_server(self) -> None:
-        """summary.py가 직접 띄운 llama-server 프로세스가 있으면 종료합니다."""
-        if self._llama_proc and self._llama_proc.poll() is None:
-            try:
-                self._llama_proc.terminate()
-                self._llama_proc.wait(timeout=5)
-            except Exception:
-                pass
-            self._llama_proc = None
-
-    @staticmethod
-    def fallback_extractive_summary(title: str, content: str) -> str:
-        """SLM 서버가 오프라인일 때 사용하는 규칙 기반 핵심 문장 추출 폴백입니다."""
-        cleaned = clean_article_content(content, max_chars=1200)
-        cleaned = re.sub(r"\[[^\]]{2,30}\]", " ", cleaned)
-        sents = [
-            s.strip()
-            for s in re.split(r"(?<=[.?!다])\s+", cleaned)
-            if 25 <= len(s.strip()) <= 200 and not s.strip().endswith("기자")
-        ]
-        if len(sents) >= 2:
-            return f"{sents[0]} {sents[1]}"
-        if sents:
-            return sents[0]
-        return cleaned[:220] if cleaned else title
-
-    def summarize_text(self, title: str, content: str, max_tokens: int = 220) -> dict[str, Any]:
-        """
-        단일 기사의 TITLE과 CONTENT를 입력받아 kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF 모델로
-        한국어 2~3문장 핵심 요약을 생성합니다.
-        """
-        t0 = time.perf_counter()
-        cleaned_body = clean_article_content(content, max_chars=1500)
-        if not cleaned_body:
-            return {
-                "summary": title.strip(),
-                "model": "empty-content",
-                "elapsed_ms": 0.0,
-                "used_slm": False,
-            }
-
-        server_ok = self.ensure_local_slm_server()
-        if server_ok:
-            try:
-                from openai import OpenAI
-
-                client = OpenAI(base_url=self.base_url, api_key=self.api_key)
-                # 서버에서 인식된 모델 확인
-                active_model = self.model_id
-                try:
-                    models = [m.id for m in client.models.list().data]
-                    if models and active_model not in models:
-                        # kanana 모델이 목록에 있으면 우선 선택
-                        kanana_matches = [m for m in models if "kanana" in m.lower()]
-                        active_model = kanana_matches[0] if kanana_matches else models[0]
-                except Exception:
-                    pass
-
-                system_prompt = (
-                    "너는 한국어 뉴스 기사를 정확하고 간결하게 요약하는 AI 요약기야. "
-                    "기사에 없는 내용은 절대 지어내지 말고, 핵심 사실과 요지를 한국어 2~3문장으로만 요약해."
-                )
-                user_prompt = (
-                    f"[기사 제목]\n{title.strip()}\n\n"
-                    f"[기사 본문]\n{cleaned_body}\n\n"
-                    "위 기사의 핵심 내용을 군더더기 없이 2~3문장으로 요약해줘:"
-                )
-
-                resp = client.chat.completions.create(
-                    model=active_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=max_tokens,
-                    timeout=45.0,
-                )
-                raw_summary = (resp.choices[0].message.content or "").strip()
-                # 불필요한 마크다운 기호나 머리말 정리
-                summary_clean = re.sub(r"^(\*\*요약\*\*|요약\s*[:：]|#+\s*요약)\s*", "", raw_summary).strip()
-                summary_clean = re.sub(r"\s+", " ", summary_clean)
-
-                if summary_clean:
-                    elapsed = round((time.perf_counter() - t0) * 1000, 1)
-                    return {
-                        "summary": summary_clean,
-                        "model": active_model,
-                        "elapsed_ms": elapsed,
-                        "used_slm": True,
-                    }
-            except Exception as e:
-                print(f"[경고] Kanana SLM 요약 호출 오류 ({e}) -> 추출형 요약 폴백 사용")
-
-        fallback = self.fallback_extractive_summary(title, content)
-        elapsed = round((time.perf_counter() - t0) * 1000, 1)
-        return {
-            "summary": fallback,
-            "model": "extractive-fallback",
-            "elapsed_ms": elapsed,
-            "used_slm": False,
-        }
-
-    def summarize_news_by_pk(self, news_pk: int, force: bool = False) -> dict[str, Any] | None:
-        """
-        news.db의 NEWS 테이블에서 특정 PK의 CONTENT를 읽어 요약하고 DB(NEWS 및 RAG_INDEX)에 저장합니다.
-        """
-        with sqlite3.connect(str(self.db_path)) as con:
-            cur = con.cursor()
-            row = cur.execute(
-                """
-                SELECT N.PK, N.TITLE, N.CONTENT, COALESCE(N.SUMMARY, ''), COALESCE(N.SUMMARY_MODEL, ''),
-                       COALESCE(N.SUMMARY_AT, ''), COALESCE(N.CATEGORY, '시사·종합'), COALESCE(L.URL, '')
-                FROM NEWS N
-                LEFT JOIN LINK L ON N.FK = L.PK
-                WHERE N.PK = ?
-                """,
-                (news_pk,),
-            ).fetchone()
-
-        if not row:
-            return None
-
-        pk, title, content, existing_summary, existing_model, existing_at, category, url = row
-        if existing_summary.strip() and not force:
-            return {
-                "news_pk": pk,
-                "title": title,
-                "category": category,
-                "url": url,
-                "summary": existing_summary,
-                "model": existing_model or self.model_id,
-                "summary_at": existing_at,
-                "cached": True,
-                "elapsed_ms": 0.0,
-            }
-
-        res = self.summarize_text(title=title, content=content)
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        with sqlite3.connect(str(self.db_path)) as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                UPDATE NEWS
-                SET SUMMARY = ?, SUMMARY_MODEL = ?, SUMMARY_AT = ?
-                WHERE PK = ?
-                """,
-                (res["summary"], res["model"], now_str, pk),
-            )
-            # RAG_INDEX가 존재하면 함께 업데이트
-            try:
-                cur.execute(
-                    "UPDATE RAG_INDEX SET SUMMARY = ? WHERE NEWS_PK = ?",
-                    (res["summary"], pk),
-                )
-            except sqlite3.OperationalError:
-                pass
-            con.commit()
-
-        return {
-            "news_pk": pk,
-            "title": title,
-            "category": category,
-            "url": url,
-            "summary": res["summary"],
-            "model": res["model"],
-            "summary_at": now_str,
-            "cached": False,
-            "used_slm": res["used_slm"],
-            "elapsed_ms": res["elapsed_ms"],
-        }
-
-    def summarize_batch(
-        self,
-        limit: int = 20,
-        force: bool = False,
-        category: str | None = None,
-        render_url: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        news.db의 NEWS 테이블에서 아직 요약되지 않은 기사들을 읽어 순차적으로 요약하고 DB에 저장합니다.
-        render_url이 지정된 경우 요약 완료된 데이터를 Render($0) 웹서비스로 즉시 Push 동기화합니다.
-        """
-        where_clauses = ["length(TRIM(CONTENT)) >= 120", "TITLE NOT LIKE '[포토]%'"]
-        params: list[Any] = []
-
-        if not force:
-            where_clauses.append("(SUMMARY IS NULL OR TRIM(SUMMARY) = '')")
-        if category and category != "전체":
-            where_clauses.append("CATEGORY = ?")
-            params.append(category)
-
-        where_sql = " AND ".join(where_clauses)
-        with sqlite3.connect(str(self.db_path)) as con:
-            cur = con.cursor()
-            target_pks = [
-                r[0]
-                for r in cur.execute(
-                    f"SELECT PK FROM NEWS WHERE {where_sql} ORDER BY PK DESC LIMIT ?",
-                    (*params, limit),
-                ).fetchall()
-            ]
-
-        results: list[dict[str, Any]] = []
-        print(f"[배치 요약 시작] 대상 기사 {len(target_pks)}건 (모델: {self.model_id})")
-        for idx, pk in enumerate(target_pks, 1):
-            item = self.summarize_news_by_pk(pk, force=force)
-            if item:
-                results.append(item)
-                short_title = item["title"][:32] + ("..." if len(item["title"]) > 32 else "")
-                print(
-                    f"  [{idx}/{len(target_pks)}] PK={pk} ({item['elapsed_ms']}ms) | "
-                    f"{short_title} -> {item['summary'][:55]}..."
-                )
-
-        push_result = None
-        target_render = (render_url or DEFAULT_RENDER_URL).strip()
-        if target_render and results:
-            push_result = self.push_summaries_to_render(target_render, items=results)
-
-        stats = self.get_summary_stats()
-        return {
-            "processed_count": len(results),
-            "items": results,
-            "stats": stats,
-            "render_push": push_result,
-        }
-
-    def get_summary_stats(self) -> dict[str, Any]:
-        """news.db 내 전체 기사 수 및 요약 완료 현황 통계를 반환합니다."""
-        with sqlite3.connect(str(self.db_path)) as con:
-            cur = con.cursor()
-            total = cur.execute("SELECT COUNT(*) FROM NEWS").fetchone()[0]
-            summarized = cur.execute(
-                "SELECT COUNT(*) FROM NEWS WHERE SUMMARY IS NOT NULL AND TRIM(SUMMARY) != ''"
-            ).fetchone()[0]
-            slm_count = cur.execute(
-                "SELECT COUNT(*) FROM NEWS WHERE SUMMARY_MODEL LIKE '%kanana%' OR SUMMARY_MODEL LIKE '%GGUF%'"
-            ).fetchone()[0]
-        return {
-            "total_news": total,
-            "summarized_news": summarized,
-            "slm_summarized_news": slm_count,
-            "remaining_news": max(0, total - summarized),
-            "progress_pct": round(summarized * 100.0 / max(1, total), 1),
-            "model": self.model_id,
-            "slm_server_online": self.is_llm_server_online(),
-            "slm_base_url": self.base_url,
-        }
-
-    def list_summaries(
-        self,
-        limit: int = 30,
-        offset: int = 0,
-        category: str | None = None,
-        keyword: str | None = None,
-        only_summarized: bool = True,
-    ) -> list[dict[str, Any]]:
-        """저장된 뉴스 요약 목록을 조회합니다."""
-        where_clauses = ["1=1"]
-        params: list[Any] = []
-        if only_summarized:
-            where_clauses.append("N.SUMMARY IS NOT NULL AND TRIM(N.SUMMARY) != ''")
-        if category and category != "전체":
-            where_clauses.append("N.CATEGORY = ?")
-            params.append(category)
-        if keyword and keyword.strip():
-            kw = f"%{keyword.strip()}%"
-            where_clauses.append("(N.TITLE LIKE ? OR N.CONTENT LIKE ? OR N.SUMMARY LIKE ?)")
-            params.extend([kw, kw, kw])
-
-        where_sql = " AND ".join(where_clauses)
-        with sqlite3.connect(str(self.db_path)) as con:
-            cur = con.cursor()
-            rows = cur.execute(
-                f"""
-                SELECT
-                    N.PK,
-                    N.TITLE,
-                    COALESCE(N.CLEAN_TITLE, ''),
-                    COALESCE(N.CATEGORY, '시사·종합'),
-                    COALESCE(N.CLUSTER_LABEL, ''),
-                    COALESCE(N.SUMMARY, ''),
-                    COALESCE(N.SUMMARY_MODEL, ''),
-                    COALESCE(N.SUMMARY_AT, ''),
-                    COALESCE(N.REGDATE, ''),
-                    COALESCE(L.URL, ''),
-                    SUBSTR(N.CONTENT, 1, 240)
-                FROM NEWS N
-                LEFT JOIN LINK L ON N.FK = L.PK
-                WHERE {where_sql}
-                ORDER BY CASE WHEN N.SUMMARY != '' THEN 0 ELSE 1 END, N.PK DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*params, limit, offset),
-            ).fetchall()
-
-        out: list[dict[str, Any]] = []
-        for pk, title, clean_t, cat, clabel, summary, smodel, sat, regdate, url, snippet in rows:
-            out.append(
-                {
-                    "news_pk": pk,
-                    "title": title,
-                    "clean_title": clean_t,
-                    "category": cat,
-                    "cluster_label": clabel,
-                    "summary": summary,
-                    "summary_model": smodel,
-                    "summary_at": sat,
-                    "regdate": regdate,
-                    "url": url,
-                    "content_snippet": snippet,
-                }
-            )
-        return out
-
-    def push_summaries_to_render(
-        self,
-        render_base_url: str,
-        items: list[dict[str, Any]] | None = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """
-        노트북에서 요약한 NEWS.SUMMARY 데이터를 Render($0 무료 요금제) 웹서비스의
-        /api/receive-summaries 엔드포인트로 전송(Push)합니다.
-        """
-        clean_url = render_base_url.rstrip("/")
-        endpoint = f"{clean_url}/api/receive-summaries"
-
-        if items is None:
-            items = self.list_summaries(limit=limit, only_summarized=True)
-
-        payload_items = [
-            {
-                "news_pk": it["news_pk"],
-                "title": it.get("title", ""),
-                "summary": it.get("summary", ""),
-                "model": it.get("model") or it.get("summary_model") or self.model_id,
-                "summary_at": it.get("summary_at", ""),
-            }
-            for it in items
-            if it.get("summary")
-        ]
-
-        if not payload_items:
-            return {"status": "empty", "pushed_count": 0, "target": endpoint}
-
-        headers = {"Content-Type": "application/json"}
-        if SUMMARY_SYNC_TOKEN:
-            headers["X-Summary-Token"] = SUMMARY_SYNC_TOKEN
-
-        try:
-            resp = httpx.post(
-                endpoint,
-                json={"summaries": payload_items},
-                headers=headers,
-                timeout=20.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            print(f"[Render 동기화 성공] {len(payload_items)}건의 요약을 {endpoint} 로 전송했습니다.")
-            return {
-                "status": "ok",
-                "pushed_count": len(payload_items),
-                "target": endpoint,
-                "remote_response": data,
-            }
-        except Exception as e:
-            print(f"[Render 동기화 실패] {endpoint} 전송 중 오류: {e}")
-            return {
-                "status": "error",
-                "pushed_count": 0,
-                "target": endpoint,
-                "error": str(e),
-            }
-
-
-# =====================================================================
-# 웹서비스 제공용 FastAPI 애플리케이션 (노트북 요약 서버 & 대시보드)
-# =====================================================================
 
 
 def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
@@ -745,8 +60,8 @@ def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
             "news.db의 NEWS.CONTENT를 요약하고 Render($0) 웹서비스에 제공하는 API 서버"
         ),
     )
+    app.state.summarizer = engine
 
-    # Render에 배포된 웹서비스 브라우저/백엔드 어디서든 호출 가능하도록 CORS 허용
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -1065,7 +380,28 @@ def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
     return app
 
 
-app = create_summary_app()
+_summary_app_instance: Any = None
+
+
+def get_summary_app(summarizer: LocalKananaSummarizer | None = None) -> Any:
+    """
+    [리팩토링] 모듈 임포트 시점에 LocalKananaSummarizer가 중복 생성되는 현상을 막기 위한
+    지연 초기화(Lazy Singleton) 팩토리 함수입니다.
+    """
+    global _summary_app_instance
+    if summarizer is not None:
+        _summary_app_instance = create_summary_app(summarizer)
+        return _summary_app_instance
+    if _summary_app_instance is None:
+        _summary_app_instance = create_summary_app()
+    return _summary_app_instance
+
+
+def __getattr__(name: str) -> Any:
+    """`uvicorn summary:app` 또는 `from summary import app` 호출 시에만 지연 생성"""
+    if name == "app":
+        return get_summary_app()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 def main() -> None:
@@ -1109,7 +445,6 @@ def main() -> None:
         n_gpu_layers=args.ngl,
     )
 
-    # 특정 PK 1건 요약 요청 시
     if args.pk is not None:
         res = summarizer.summarize_news_by_pk(args.pk, force=True)
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1117,7 +452,6 @@ def main() -> None:
             summarizer.push_summaries_to_render(args.render_url, items=[res])
         return
 
-    # 배치 요약만 수행 후 종료하는 모드
     if args.mode == "batch":
         out = summarizer.summarize_batch(
             limit=args.limit,
@@ -1130,7 +464,6 @@ def main() -> None:
         )
         return
 
-    # 방법 B (serve / auto): 4GB GPU SLM 서버를 먼저 기동하고 백그라운드 요약 + 요약 제공 웹서버 즉시 실행
     import threading
     import webbrowser
     import uvicorn
@@ -1158,8 +491,33 @@ def main() -> None:
         daemon=True,
     ).start()
 
-    server_app = create_summary_app(summarizer)
+    server_app = get_summary_app(summarizer)
     uvicorn.run(server_app, host=args.host, port=args.port)
+
+
+__all__ = [
+    "DEFAULT_MODEL_REPO",
+    "DEFAULT_GGUF_FILENAME",
+    "DEFAULT_LLAMA_SERVER_PORT",
+    "DEFAULT_LLAMA_BASE_URL",
+    "DEFAULT_API_KEY",
+    "DEFAULT_SUMMARY_PORT",
+    "DEFAULT_RENDER_URL",
+    "SUMMARY_SYNC_TOKEN",
+    "clean_article_content",
+    "connect_summary_db",
+    "ensure_summary_columns",
+    "find_local_gguf_path",
+    "find_llama_server_exe",
+    "probe_openai_models_url",
+    "find_free_port",
+    "start_optimized_llama_server",
+    "LocalKananaSummarizer",
+    "create_summary_app",
+    "get_summary_app",
+    "app",
+    "main",
+]
 
 
 if __name__ == "__main__":
