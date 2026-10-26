@@ -51,7 +51,7 @@ def create_fastapi_app():
     from fastapi import FastAPI
     from fastapi.responses import HTMLResponse
     from pydantic import BaseModel, Field
-    from langgraph import NJKAgent
+    from mylggraph import NJKAgent
 
     app = FastAPI(
         title="Nexus (논점콩) - OpenAI Head LLM 기반 Multi-Agent Orchestration 뉴스 분석 서버",
@@ -166,7 +166,7 @@ def create_fastapi_app():
                 "model": model,
                 "roles": [
                     "1. 질의 의도 분석·키워드 확장 및 실행 계획 수립 (supervisor_plan)",
-                    "2. 검색된 기사 품질·언론사 다양성 평가 및 동적 라우팅 (supervisor_route)",
+                    "2. 클러스터 센트로이드 & 코사인 유사도 임계값 기반 시맨틱 라우팅 (SemanticCentroidRouter)",
                     "3. 관점 A/B 대립축 심판 및 최종 결과 감수 (judge_verifier_agent)",
                 ],
             },
@@ -174,6 +174,10 @@ def create_fastapi_app():
                 {
                     "id": "RAGRetrievalSubAgent",
                     "description": "news.db 기반 sqlite-vec(title_vec) + TF-IDF + 키워드 하이브리드 검색 및 언론사 다양성 리랭킹",
+                },
+                {
+                    "id": "SemanticCentroidRouter",
+                    "description": "54개 KMeans 이슈 클러스터 센트로이드 및 검색 기사군 센트로이드 코사인 유사도 임계값 기반 초고속 시맨틱 라우터",
                 },
                 {
                     "id": "ComparisonSynthesisSubAgent",

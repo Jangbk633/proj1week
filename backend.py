@@ -1,13 +1,14 @@
 """
-backend.py - OpenAI Head LLM 설정, ML 분류기 추론, Multi-Agent Orchestrator(OpenAISupervisorHead +
-MultiAgentNewsOrchestrator) 및 기사 심판 백엔드 엔진 모듈
+backend.py - OpenAI Head LLM 설정, ML 분류기 추론, Semantic Centroid Router,
+Multi-Agent Orchestrator(OpenAISupervisorHead + MultiAgentNewsOrchestrator) 및 기사 심판 백엔드 엔진 모듈
 
 [포함 구성 요소]
 1. resolve_openai_config() / get_openai_client(): OpenAI Head LLM 설정 및 클라이언트 관리
 2. classify_news_with_exported_model(): best_news_classifier.joblib (Calibrated LinearSVC) 추론
-3. OpenAISupervisorHead: 질의 계획(plan_query_and_keywords) 및 LLM-as-a-Judge 라우팅(evaluate_evidence_and_route)
-4. MultiAgentNewsOrchestrator: LangGraph 6-Node 멀티 에이전트 파이프라인
-5. judge_articles_with_openai() / judge_single_custom_article_with_openai(): 기사 논조·대립축 심판 및 검증
+3. SemanticCentroidRouter: 클러스터 센트로이드 & 코사인 유사도 임계값 기반 초고속 시맨틱 라우터 (Node 3)
+4. OpenAISupervisorHead: 질의 계획(plan_query_and_keywords) 및 시맨틱 라우팅 연동
+5. MultiAgentNewsOrchestrator: LangGraph 6-Node 멀티 에이전트 파이프라인
+6. judge_articles_with_openai() / judge_single_custom_article_with_openai(): 기사 논조·대립축 심판 및 검증
 """
 
 from __future__ import annotations
@@ -18,7 +19,10 @@ import re
 import time
 from typing import Any, Literal, TypedDict
 
+import numpy as np
+
 from preprocessing import preprocess_korean_news_for_classifier
+from vectorize import text_to_vector
 
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = ROOT_DIR / ".env"
@@ -386,75 +390,141 @@ class OpenAISupervisorHead:
         self,
         query: str,
         articles: list[dict[str, Any]],
-        base_url: str,
-        api_key: str,
-        model: str,
+        base_url: str = "",
+        api_key: str = "",
+        model: str = "",
         crawled: bool = False,
+        cluster_centroids: dict[int, tuple[str, np.ndarray]] | None = None,
     ) -> dict[str, Any]:
         """
-        [Head LLM Step 2 - LLM-as-a-Judge] RAG 서브 에이전트가 news.db에서 검색한 기사들을
-        LLM Judge(심판)가 직접 평가하여 다음 실행할 서브 에이전트(comparison_agent / guard_agent)를 라우팅합니다.
+        [Node 3 - Semantic Centroid Router]
+        LLM-as-a-Judge(외부 LLM API 호출)를 사용하지 않고,
+        클러스터 센트로이드 코사인 유사도, 검색 기사군 센트로이드 응집도 및 하이브리드 유사도 임계값으로
+        다음 서브 에이전트(comparison_agent / guard_agent)를 초고속 라우팅합니다.
         """
+        router = SemanticCentroidRouter(cluster_centroids=cluster_centroids)
+        return router.route(query=query, articles=articles)
+
+
+class SemanticCentroidRouter:
+    """
+    [순수 시맨틱 라우터 - 클러스터 센트로이드 & 코사인 유사도 임계값 기반]
+    LLM-as-a-Judge를 오프라인 모델 평가용으로만 분리하고, 실시간 파이프라인의 Node 3(supervisor_route)에서는
+    512차원 임베딩 벡터와 클러스터 센트로이드(Centroid) 코사인 유사도 임계값으로 밀리초(ms) 단위의 결정론적 라우팅을 수행합니다.
+
+    [판정 지표 및 임계값]
+    1. 정량 게이트: 검색 기사 수 >= 2건, 서로 다른 언론사 수 >= 2곳, 최고 하이브리드 유사도(top_score) >= 0.35
+    2. 이슈 클러스터 센트로이드 유사도(cluster_centroid_sim):
+       - 질의 벡터(q_vec)와 news.db 내 54개 KMeans 이슈 클러스터 센트로이드 간 최대 코사인 유사도
+    3. 검색 기사군 센트로이드 유사도(doc_centroid_sim):
+       - 검색된 상위 기사들의 제목·요약 합성 센트로이드 벡터와 질의 벡터 간 코사인 유사도
+    4. 종합 시맨틱 라우팅 점수(semantic_score):
+       - semantic_score = 0.45 * top_score + 0.35 * doc_centroid_sim + 0.20 * max(cluster_centroid_sim, avg_vec_sim)
+       - 임계값(>= 0.28) 충족 시 `comparison_agent`, 미달 시 `guard_agent`로 분기
+    """
+
+    MIN_ARTICLES: int = 2
+    MIN_PRESS_COUNT: int = 2
+    MIN_TOP_SCORE: float = 0.35
+    MIN_DOC_CENTROID_SIM: float = 0.18
+    MIN_SEMANTIC_SCORE: float = 0.28
+
+    def __init__(
+        self,
+        cluster_centroids: dict[int, tuple[str, np.ndarray]] | None = None,
+    ) -> None:
+        self.cluster_centroids = cluster_centroids or {}
+
+    def route(
+        self,
+        query: str,
+        articles: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         press_set = {a.get("press", "") for a in articles if a.get("press")}
         top_score = float(articles[0].get("score", 0.0)) if articles else 0.0
 
-        if len(articles) < 2 or len(press_set) < 2 or top_score < 0.35:
+        # 1. 기본 정량 임계값 점검 (기사 수, 언론사 다양성, 최고 유사도)
+        if (
+            len(articles) < self.MIN_ARTICLES
+            or len(press_set) < self.MIN_PRESS_COUNT
+            or top_score < self.MIN_TOP_SCORE
+        ):
             return {
                 "route": "guard_agent",
                 "reason": (
-                    f"[LLM Judge 사전 가드레일] 검색된 기사({len(articles)}건, {len(press_set)}개 언론사)가 "
-                    "양면 관점 비교를 수행하기에 부족하여 환각 차단 에이전트(HallucinationGuardSubAgent)로 라우팅"
+                    f"[Semantic Router 가드레일 차단] 검색 기사({len(articles)}건, {len(press_set)}개 언론사, "
+                    f"최고 유사도={top_score:.3f} < {self.MIN_TOP_SCORE})가 최소 임계값에 미달하여 "
+                    "환각 차단 에이전트(HallucinationGuardSubAgent)로 라우팅"
                 ),
                 "press_diversity_count": len(press_set),
                 "top_relevance_score": round(top_score, 4),
+                "semantic_score": round(top_score, 4),
             }
 
-        sample_lines = [
-            f"- [{a.get('press', '')}] {a.get('title', '')} (본문요약: {(a.get('summary') or a.get('content') or '')[:100]})"
-            for a in articles[:5]
-        ]
-        sys_prompt = (
-            "너는 뉴스 관점 비교 에이전트의 LLM Judge(심판)야. "
-            "검색된 기사들이 사용자 질의의 주요 인물·사건·주제와 조금이라도 관련된 시사 이슈를 다루고 있으면 반드시 '판정: 적합'으로 답해. "
-            "오직 질의가 현실에 없는 허위 주제이거나 기사들과 완전히 무관할 때만 '판정: 부적합'으로 답해."
-        )
-        usr_prompt = (
-            f"질의: {query}\n"
-            f"검색된 기사({len(articles)}건, {len(press_set)}개 언론사):\n"
-            + "\n".join(sample_lines)
-            + "\n\n형식:\n판정: (적합 또는 부적합)\n이유: (신문사별 관점 비교 적합성에 대한 한 줄 평가)"
-        )
-        ok, judge_text, _ = self._call_openai(
-            sys_prompt, usr_prompt, base_url, api_key, model, max_tokens=100, timeout=6.0
+        # 2. 질의 512차원 정규화 벡터 생성
+        q_vec = text_to_vector(query)
+
+        # 3. news.db KMeans(k=54) 클러스터 센트로이드와의 최대 코사인 유사도 계산
+        best_cluster_label = str(articles[0].get("cluster_label") or "시사·종합")
+        cluster_centroid_sim = 0.0
+        if self.cluster_centroids:
+            for _cid, (c_label, c_vec) in self.cluster_centroids.items():
+                sim = max(0.0, float(np.dot(q_vec, c_vec)))
+                if sim > cluster_centroid_sim:
+                    cluster_centroid_sim = sim
+                    best_cluster_label = c_label
+
+        # 4. 검색된 상위 기사군의 센트로이드(Centroid) 벡터 산출 및 질의-센트로이드 코사인 유사도 계산
+        doc_vecs: list[np.ndarray] = []
+        vec_sims: list[float] = []
+        for art in articles[:6]:
+            art_text = f"{art.get('clean_title') or art.get('title', '')} {(art.get('summary') or art.get('content') or '')[:120]}"
+            d_vec = text_to_vector(art_text)
+            doc_vecs.append(d_vec)
+            v_sim = float(art.get("title_vec_sim") or np.dot(q_vec, d_vec))
+            vec_sims.append(max(0.0, v_sim))
+
+        if doc_vecs:
+            mean_doc_vec = np.mean(np.stack(doc_vecs, axis=0), axis=0)
+            norm = float(np.linalg.norm(mean_doc_vec))
+            if norm > 1e-8:
+                mean_doc_vec = mean_doc_vec / norm
+            doc_centroid_sim = max(0.0, float(np.dot(q_vec, mean_doc_vec)))
+        else:
+            doc_centroid_sim = 0.0
+
+        avg_vec_sim = float(np.mean(vec_sims)) if vec_sims else 0.0
+        effective_cluster_sim = max(cluster_centroid_sim, avg_vec_sim)
+
+        # 5. 종합 시맨틱 라우팅 스코어 산출 및 임계값 판정
+        semantic_score = (
+            0.45 * top_score
+            + 0.35 * doc_centroid_sim
+            + 0.20 * effective_cluster_sim
         )
 
-        if ok and judge_text:
-            clean_j = re.sub(r"\*\*|\#", "", judge_text).strip()
-            if "부적합" in clean_j and "적합합니다" not in clean_j and top_score < 0.50:
-                return {
-                    "route": "guard_agent",
-                    "reason": f"[LLM Judge 판정: 부적합] {clean_j.replace(chr(10), ' ')} → 환각 차단 에이전트 호출",
-                    "press_diversity_count": len(press_set),
-                    "top_relevance_score": round(top_score, 4),
-                }
+        if semantic_score < self.MIN_SEMANTIC_SCORE or doc_centroid_sim < self.MIN_DOC_CENTROID_SIM:
             return {
-                "route": "comparison_agent",
+                "route": "guard_agent",
                 "reason": (
-                    f"[LLM Judge 심판 통과] {clean_j.replace(chr(10), ' ')} "
-                    f"({len(articles)}건 · {len(press_set)}개 언론사) → 관점 비교·합성 에이전트 호출"
+                    f"[Semantic Router 임계값 미달 차단] 시맨틱 점수({semantic_score:.3f} < {self.MIN_SEMANTIC_SCORE}) · "
+                    f"기사군 센트로이드 유사도({doc_centroid_sim:.3f}) 부족 → 환각 차단 에이전트 호출"
                 ),
                 "press_diversity_count": len(press_set),
                 "top_relevance_score": round(top_score, 4),
+                "semantic_score": round(semantic_score, 4),
             }
 
         return {
             "route": "comparison_agent",
             "reason": (
-                f"[LLM Judge 하이브리드 판정: 적합] news.db 내 연관 기사 {len(articles)}건({len(press_set)}개 언론사) "
-                "검증 완료 → 관점 비교·합성 에이전트(ComparisonSynthesisSubAgent) 호출 결정"
+                f"[Semantic Router 통과] 최근접 클러스터 '{best_cluster_label}'(센트로이드 유사도={effective_cluster_sim:.3f}) · "
+                f"기사군 센트로이드 유사도={doc_centroid_sim:.3f} · 시맨틱 점수={semantic_score:.3f} "
+                f"({len(articles)}건 · {len(press_set)}개 언론사) → 관점 비교·합성 에이전트 호출"
             ),
             "press_diversity_count": len(press_set),
             "top_relevance_score": round(top_score, 4),
+            "semantic_score": round(semantic_score, 4),
         }
 
 
@@ -702,6 +772,9 @@ class MultiAgentNewsOrchestrator:
         self.rag_agent = rag_agent
         self.rag = rag_agent.rag
         self.head_llm = OpenAISupervisorHead()
+        self.semantic_router = SemanticCentroidRouter(
+            cluster_centroids=getattr(self.rag, "cluster_centroids", None)
+        )
         self.memory = MemorySaver()
         self._session_queries: dict[str, list[str]] = {}
 
@@ -820,19 +893,12 @@ class MultiAgentNewsOrchestrator:
         }
 
     def _supervisor_route_node(self, state: OrchestrationState) -> dict[str, Any]:
-        """[Node 3] Head LLM(Supervisor)이 검색 품질을 평가하고 다음 서브 에이전트를 지정합니다."""
+        """[Node 3] SemanticCentroidRouter가 클러스터 센트로이드 및 코사인 유사도 임계값으로 다음 서브 에이전트를 라우팅합니다."""
         t0 = time.perf_counter()
-        base_url, api_key, model = resolve_openai_config(
-            state.get("openai_base_url"),
-            state.get("openai_api_key"),
-            state.get("openai_model"),
-        )
-        decision = self.head_llm.evaluate_evidence_and_route(
+        self.semantic_router.cluster_centroids = getattr(self.rag, "cluster_centroids", {}) or {}
+        decision = self.semantic_router.route(
             query=state.get("search_query") or state.get("query", ""),
             articles=state.get("retrieved_articles") or [],
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
@@ -840,8 +906,8 @@ class MultiAgentNewsOrchestrator:
         trace.append(
             {
                 "step": len(trace) + 1,
-                "agent": "HeadSupervisor(OpenAI)",
-                "role": "근거 기사 충분성 평가 및 동적 에이전트 라우팅",
+                "agent": "SemanticCentroidRouter",
+                "role": "클러스터 센트로이드 & 코사인 유사도 임계값 기반 시맨틱 라우팅",
                 "status": f"route->{decision['route']}",
                 "detail": decision["reason"],
                 "elapsedMs": elapsed_ms,
@@ -1120,6 +1186,7 @@ __all__ = [
     "_parse_numbered_judgment",
     "OrchestrationState",
     "OpenAISupervisorHead",
+    "SemanticCentroidRouter",
     "judge_articles_with_openai",
     "MultiAgentNewsOrchestrator",
     "judge_single_custom_article_with_openai",

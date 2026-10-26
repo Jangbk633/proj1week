@@ -1,59 +1,20 @@
 """
-langgraph.py - LangGraph 기반 뉴스 검색·크롤링·관점 비교·출처 검증 에이전트(NJKAgent) 모듈
-
-주의: 파일명이 외부 패키지(`langgraph`)와 동일하므로, 다른 파이썬 파일이나 내부에서
-`from langgraph import NJKAgent`와 `from langgraph.graph import StateGraph`를
-모두 에러 없이 사용할 수 있도록 패키지 브릿지(Bridge) 로직을 포함합니다.
+mylggraph.py - LangGraph 기반 뉴스 검색·크롤링·관점 비교·출처 검증 에이전트(NJKAgent) 모듈
 """
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
 from typing import Any, Literal, TypedDict
 
+from langgraph.graph import END, START, StateGraph
+
 from preprocessing import extract_keywords
 from rag import DEFAULT_DB_PATH, NewsDBRAG, RetrievedArticle
 from summerizer import ComparisonOutputSchema, _extractive_compare_articles
-
-
-def _bridge_installed_langgraph_submodules() -> tuple[Any, Any, Any]:
-    """
-    로컬 `langgraph.py`가 임포트되었을 때도 `langgraph.graph`, `langgraph.checkpoint.memory` 등
-    site-packages의 공식 `langgraph` 하위 패키지 임포트가 정상 동작하도록 `__path__`를 연결합니다.
-    """
-    this_dir = Path(__file__).resolve().parent
-    search_paths = [
-        p for p in sys.path
-        if Path(p if p else ".").resolve() != this_dir
-    ]
-    spec = importlib.machinery.PathFinder.find_spec("langgraph", search_paths)
-    if spec is None or not spec.submodule_search_locations:
-        raise ImportError("가상환경에서 설치된 공식 'langgraph' 패키지를 찾을 수 없습니다.")
-
-    current_mod = sys.modules.get(__name__)
-    if current_mod is not None and not hasattr(current_mod, "__path__"):
-        current_mod.__path__ = list(spec.submodule_search_locations)  # type: ignore[attr-defined]
-        if current_mod.__spec__ is not None:
-            current_mod.__spec__.submodule_search_locations = list(spec.submodule_search_locations)
-
-    # 만약 __main__으로 실행된 경우 sys.modules['langgraph']가 없을 수 있으므로 보장
-    if "langgraph" not in sys.modules:
-        pkg_mod = importlib.util.module_from_spec(spec)
-        sys.modules["langgraph"] = pkg_mod
-        if spec.loader is not None:
-            spec.loader.exec_module(pkg_mod)
-
-    import langgraph.graph as lg_graph
-    return lg_graph.END, lg_graph.START, lg_graph.StateGraph
-
-
-# 모듈 로드 시점에 즉시 브릿지를 활성화하여 외부 파일의 `from langgraph.checkpoint...` 도 지원
-_bridge_installed_langgraph_submodules()
 
 
 class AgentState(TypedDict, total=False):
@@ -80,8 +41,6 @@ class NJKAgent:
         self.graph = self._build_graph()
 
     def _build_graph(self):
-        END, START, StateGraph = _bridge_installed_langgraph_submodules()
-
         builder = StateGraph(AgentState)
         builder.add_node("analyze_query", self.analyze_query_node)
         builder.add_node("retrieve_news", self.retrieve_news_node)
