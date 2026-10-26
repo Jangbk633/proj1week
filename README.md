@@ -1,7 +1,17 @@
-레포지토리 클론해서 프론트엔드 파일 돌리시면 됩니다
+# 논점콩 - 뉴스 기사 비교 에이전트
 
-먼저 작업 폴더 만드신다음에 다음 순서대로 해주시면 됩니다
+### 1. powershell 켜기
 
-1. cmd 켜기
-2. git clone https://github.com/Jangbk633/proj1week.git
-3. python frontend.py
+### 2. git clone 하기
+```bash
+git clone https://github.com/Jangbk633/proj1week.git
+```
+### 3. frontend.py 실행하기
+```bash
+python frontend.py
+```
+### 4. 우아하게 종료하기
+#### (powershell에서)
+```bash
+deactivate
+```
