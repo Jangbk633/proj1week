@@ -131,9 +131,9 @@ def create_fastapi_app():
         orchestrationTrace: list[OrchestrationStepItem] = Field(default_factory=list)
 
     class OpenAIKeyRequest(BaseModel):
-        base_url: str = OPENAI_BASE_URL
-        api_key: str = OPENAI_API_KEY
-        model: str = OPENAI_MODEL
+        base_url: str | None = None
+        api_key: str | None = None
+        model: str | None = None
 
     class CustomArticleJudgeRequest(BaseModel):
         topic: str = ""

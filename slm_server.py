@@ -28,12 +28,9 @@ if ENV_FILE.exists():
 
 DEFAULT_MODEL_REPO = os.environ.get("UNSLOTH_MODEL", "kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF").strip()
 DEFAULT_GGUF_FILENAME = "kanana-nano-2.1b-instruct-q8_0.gguf"
-DEFAULT_LLAMA_SERVER_PORT = 8891
+DEFAULT_LLAMA_SERVER_PORT = int(os.environ.get("LLAMA_SERVER_PORT", "8891"))
 DEFAULT_LLAMA_BASE_URL = f"http://127.0.0.1:{DEFAULT_LLAMA_SERVER_PORT}/v1"
-DEFAULT_API_KEY = os.environ.get(
-    "UNSLOTH_API_KEY",
-    "sk-unsloth-f65f99d826c89c73362ddeb617e7963e",
-).strip()
+DEFAULT_API_KEY = os.environ.get("UNSLOTH_API_KEY", "").strip()
 
 
 def find_local_gguf_path(repo_id: str = DEFAULT_MODEL_REPO, filename: str = DEFAULT_GGUF_FILENAME) -> Path | None:
@@ -89,9 +86,10 @@ def probe_openai_models_url(base_url: str, api_key: str = DEFAULT_API_KEY) -> bo
     """
     models_url = f"{base_url.rstrip('/')}/models"
     try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         req = urllib.request.Request(
             models_url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
         )
         with urllib.request.urlopen(req, timeout=2.5) as resp:
             if resp.status != 200:

@@ -210,7 +210,7 @@ class LocalKananaSummarizer:
             try:
                 from openai import OpenAI
 
-                client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+                client = OpenAI(base_url=self.base_url, api_key=self.api_key or "local-slm")
                 active_model = self.model_id
                 try:
                     models = [m.id for m in client.models.list().data]

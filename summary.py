@@ -364,7 +364,7 @@ def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
             try:
                 from openai import OpenAI
 
-                client = OpenAI(base_url=engine.base_url, api_key=engine.api_key)
+                client = OpenAI(base_url=engine.base_url, api_key=engine.api_key or "local-slm")
                 resp = client.chat.completions.create(
                     model=engine.model_id,
                     messages=req.messages,  # type: ignore[arg-type]
