@@ -17,13 +17,13 @@ deactivate
 ```
 ---
 preprocessing.py  : 뉴스 제목 및 본문 전처리, 키워드·언론사명 추출 및 HTML 파싱  
-vectorize.py      : 뉴스 제목 text_to_vector 임베딩 및 sqlite-vec 직렬화(serialize_vec)  
-rag.py            : NewsDBRAG 기반 sqlite-vec 하이브리드 RAG 검색, 6대 카테고리·KMeans 군집화 및 실시간 뉴스 크롤링(ensure_rag_index, retrieve 등)  
-summerizer.py     : 벡터 거리 기반 관점 군집화 및 비교 요약 생성(_extractive_compare_articles)  
+vectorize.py      : 뉴스 제목 text_to_vector 임베딩 및 sqlite-vec 직렬화  
+rag.py            : NewsDBRAG 기반 sqlite-vec 하이브리드 RAG 검색, 6대 카테고리·KMeans 군집화  
+summerizer.py     : 벡터 거리 기반 관점 군집화 및 비교 요약 생성  
 langgraph.py      : LangGraph 기반 뉴스 검색·관점 비교·출처 검증 및 패키지 브릿지  
-backend.py        : OpenAI Head LLM 감독기(OpenAISupervisorHead), LangGraph 6-Node 멀티에이전트 오케스트레이터(MultiAgentNewsOrchestrator), ML 분류기 추론 및 기사 논조 심판 엔진  
-frontend.py       : userinterface.html 웹 UI 서빙, 12개 분석·분류·동기화 REST API(create_fastapi_app) 및 가상환경·브라우저 자동 런처(main)  
-app.py            : 배포 및 ASGI 서버(uvicorn app:app) 구동을 위해 frontend.py의 FastAPI 앱(app) 객체를 재노출하는 엔트리포인트 모듈  
-slm_server.py     : 로컬 GGUF 모델(Kanana-Nano 2.1B) 탐색·다운로드 및 llama-server.exe 자동 기동(start_optimized_llama_server)  
+backend.py        : Head LLM, LangGraph 6-Node 멀티에이전트 오케스트레이터, ML 분류기 추론 및 기사 논조 심판 엔진  
+frontend.py       : userinterface.html 웹 UI 서빙  
+app.py            : frontend.py의 FastAPI 앱 객체를 재노출하는 엔트리포인트  
+slm_server.py     : 로컬 SLM 모델 탐색·다운로드 및 llama-server.exe 자동 기동  
 summary_engine.py : LocalKananaSummarizer 기반 로컬 GPU 뉴스 요약 생성  
 summary.py        : 로컬 SLM 뉴스 요약 대시보드 UI, 단건/배치 요약 REST API, OpenAI 호환 프록시 서버 및 CLI 런처  
