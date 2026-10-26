@@ -11,7 +11,7 @@ git clone https://github.com/Jangbk633/proj1week.git
 python frontend.py
 ```
 ### 4. 우아하게 종료하기
-#### (powershell에서)
+ctrl+c로 종료 후 powershell에서 가상환경 종료하기
 ```bash
 deactivate
 ```
