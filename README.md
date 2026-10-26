@@ -15,6 +15,9 @@ ctrl+c로 종료 후 powershell에서 가상환경 종료하기
 ```bash
 deactivate
 ```
+  
+train_classifier_and_summarizer.html에서 모델 튜닝 과정 확인 가능
+    
 ---
 preprocessing.py  : 뉴스 제목 및 본문 전처리, 키워드·언론사명 추출 및 HTML 파싱  
 vectorize.py      : 뉴스 제목 text_to_vector 임베딩 및 sqlite-vec 직렬화  
