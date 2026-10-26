@@ -22,12 +22,19 @@ from typing import Any, Literal, TypedDict
 import numpy as np
 
 from preprocessing import preprocess_korean_news_for_classifier
+from slm_server import (
+    FINETUNED_SAFETENSORS_FILE,
+    FINETUNED_SUMMARIZER_DIR,
+    get_finetuned_summarizer_info,
+)
 from vectorize import text_to_vector
 
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = ROOT_DIR / ".env"
 DB_FILE = ROOT_DIR / "news.db"
 CLASSIFIER_MODEL_FILE = ROOT_DIR / "best_news_classifier.joblib"
+SUMMARIZER_MODEL_DIR = FINETUNED_SUMMARIZER_DIR
+SUMMARIZER_SAFETENSORS_FILE = FINETUNED_SAFETENSORS_FILE
 
 if ENV_FILE.exists():
     for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
@@ -1174,6 +1181,9 @@ __all__ = [
     "ENV_FILE",
     "DB_FILE",
     "CLASSIFIER_MODEL_FILE",
+    "SUMMARIZER_MODEL_DIR",
+    "SUMMARIZER_SAFETENSORS_FILE",
+    "get_finetuned_summarizer_info",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
     "OPENAI_MODEL",

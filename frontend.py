@@ -24,12 +24,15 @@ from backend import (
     OPENAI_BASE_URL,
     OPENAI_MODEL,
     ROOT_DIR,
+    SUMMARIZER_MODEL_DIR,
+    SUMMARIZER_SAFETENSORS_FILE,
     MultiAgentNewsOrchestrator,
     OpenAISupervisorHead,
     OrchestrationState,
     _detect_article_tone,
     _parse_numbered_judgment,
     classify_news_with_exported_model,
+    get_finetuned_summarizer_info,
     get_openai_client,
     judge_articles_with_openai,
     judge_single_custom_article_with_openai,
@@ -208,7 +211,7 @@ def create_fastapi_app():
             server_online = True
         except Exception:
             available_models = [
-                "kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF",
+                "kanana_summarizer_full_ft_model",
                 "kakaocorp/kanana-nano-2.1b-instruct",
                 "kakaocorp/kanana-nano-2.1b-base",
                 "unsloth/Qwen3.5-2B-GGUF",
@@ -325,10 +328,15 @@ def create_fastapi_app():
 
     @app.get("/api/classifier-info")
     async def get_exported_classifier_info():
-        """news_classifier.ipynb에서 Export된 최고 점수 분류기(best_news_classifier.joblib)의 메타데이터 및 성능 지표를 반환합니다."""
+        """파인튜닝 완료된 분류기(best_news_classifier.joblib) 및 요약기(kanana_summarizer_full_ft_model/model.safetensors) 메타데이터를 반환합니다."""
         bundle = load_exported_news_classifier()
+        summarizer_info = get_finetuned_summarizer_info()
         if not bundle:
-            return {"loaded": False, "model_file": str(CLASSIFIER_MODEL_FILE)}
+            return {
+                "loaded": False,
+                "model_file": str(CLASSIFIER_MODEL_FILE),
+                "summarizer_model": summarizer_info,
+            }
         return {
             "loaded": True,
             "model_file": str(CLASSIFIER_MODEL_FILE),
@@ -337,7 +345,13 @@ def create_fastapi_app():
             "metrics": bundle.get("metrics", {}),
             "all_model_metrics": bundle.get("all_model_metrics", []),
             "cluster_label_map": bundle.get("cluster_label_map", {}),
+            "summarizer_model": summarizer_info,
         }
+
+    @app.get("/api/summarizer-info")
+    async def get_finetuned_summarizer_endpoint():
+        """파인튜닝 완료된 요약기(kanana_summarizer_full_ft_model/model.safetensors) 정보를 반환합니다."""
+        return get_finetuned_summarizer_info()
 
     @app.post("/api/ml-classify")
     async def ml_classify_endpoint(req: ClassifyNewsRequest):
@@ -366,7 +380,7 @@ def create_fastapi_app():
         news_pk: int
         title: str = ""
         summary: str
-        model: str = "kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF"
+        model: str = "kanana_summarizer_full_ft_model"
         summary_at: str = ""
 
     class ReceiveSummariesRequest(BaseModel):

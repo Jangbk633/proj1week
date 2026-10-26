@@ -28,9 +28,13 @@ from slm_server import (
     DEFAULT_LLAMA_BASE_URL,
     DEFAULT_LLAMA_SERVER_PORT,
     DEFAULT_MODEL_REPO,
+    FINETUNED_SAFETENSORS_FILE,
+    FINETUNED_SUMMARIZER_DIR,
+    find_finetuned_safetensors_model,
     find_free_port,
     find_llama_server_exe,
     find_local_gguf_path,
+    get_finetuned_summarizer_info,
     probe_openai_models_url,
     start_optimized_llama_server,
 )
@@ -54,10 +58,10 @@ def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
     engine = summarizer or LocalKananaSummarizer()
 
     app = FastAPI(
-        title="Kanana-Nano 2.1B 로컬 GPU 뉴스 요약 서버 (summary.py)",
+        title="Kanana-Nano 2.1B 파인튜닝 뉴스 요약 서버 (summary.py)",
         description=(
-            "VRAM 4GB 노트북에서 kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF 모델을 돌려 "
-            "news.db의 NEWS.CONTENT를 요약하고 Render($0) 웹서비스에 제공하는 API 서버"
+            "파인튜닝된 요약기(kanana_summarizer_full_ft_model/model.safetensors)를 사용하여 "
+            "news.db의 NEWS.CONTENT를 요약하고 웹서비스에 제공하는 API 서버"
         ),
     )
     app.state.summarizer = engine
@@ -157,9 +161,9 @@ def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
   <div class="container">
     <div class="header">
       <div>
-        <h2 style="margin:0 0 6px 0;">노트북 4GB GPU 뉴스 요약 서버 (summary.py)</h2>
+        <h2 style="margin:0 0 6px 0;">파인튜닝 뉴스 요약 서버 (summary.py)</h2>
         <div style="font-size:13px;color:var(--muted);">
-          모델: <code>kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF</code> · DB: <code>news.db (NEWS.CONTENT → NEWS.SUMMARY)</code>
+          요약기: <code>kanana_summarizer_full_ft_model/model.safetensors</code> · 분류기: <code>best_news_classifier.joblib</code> · DB: <code>news.db</code>
         </div>
       </div>
       <span id="serverBadge" class="badge">상태 확인 중...</span>

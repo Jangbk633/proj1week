@@ -30,9 +30,14 @@ from slm_server import (
     DEFAULT_LLAMA_BASE_URL,
     DEFAULT_LLAMA_SERVER_PORT,
     DEFAULT_MODEL_REPO,
+    FINETUNED_SAFETENSORS_FILE,
+    FINETUNED_SUMMARIZER_DIR,
+    find_finetuned_safetensors_model,
     find_free_port,
     find_llama_server_exe,
     find_local_gguf_path,
+    generate_summary_with_safetensors,
+    get_finetuned_summarizer_info,
     probe_openai_models_url,
     start_optimized_llama_server,
 )
@@ -86,7 +91,7 @@ def ensure_summary_columns(db_path: str | Path = DEFAULT_DB_PATH) -> None:
 
 class LocalKananaSummarizer:
     """
-    VRAM 4GB GPU 환경에서 kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF 모델을 구동하여
+    파인튜닝 완료된 `kanana_summarizer_full_ft_model/model.safetensors` 모델(또는 로컬 OpenAI 호환 SLM 서버)을 구동하여
     news.db의 기사를 요약하는 로컬 SLM 엔진입니다.
     """
 
@@ -99,6 +104,7 @@ class LocalKananaSummarizer:
         n_gpu_layers: int = 99,
         ctx_size: int = 2048,
         auto_start_server: bool = True,
+        model_dir: str | Path = FINETUNED_SUMMARIZER_DIR,
     ) -> None:
         self.db_path = Path(db_path)
         self.model_id = model_id
@@ -107,6 +113,8 @@ class LocalKananaSummarizer:
         self.n_gpu_layers = n_gpu_layers
         self.ctx_size = ctx_size
         self.auto_start_server = auto_start_server
+        self.finetuned_model_dir = Path(model_dir)
+        self.safetensors_file = self.finetuned_model_dir / "model.safetensors"
         self._llama_proc: subprocess.Popen | None = None
 
         ensure_summary_columns(self.db_path)
@@ -192,8 +200,8 @@ class LocalKananaSummarizer:
 
     def summarize_text(self, title: str, content: str, max_tokens: int = 220) -> dict[str, Any]:
         """
-        단일 기사의 TITLE과 CONTENT를 입력받아 kenonix/kanana-nano-2.1b-instruct-Q8_0-GGUF 모델로
-        한국어 2~3문장 핵심 요약을 생성합니다.
+        단일 기사의 TITLE과 CONTENT를 입력받아 파인튜닝된 `kanana_summarizer_full_ft_model/model.safetensors`
+        (또는 로컬 OpenAI 호환 SLM 서버)로 한국어 2~3문장 핵심 요약을 생성합니다.
         """
         t0 = time.perf_counter()
         cleaned_body = clean_article_content(content, max_chars=1500)
@@ -205,6 +213,26 @@ class LocalKananaSummarizer:
                 "used_slm": False,
             }
 
+        # 1순위: auto_start_server 활성화 시 파인튜닝된 kanana_summarizer_full_ft_model/model.safetensors 직접 추론 시도
+        if self.auto_start_server and find_finetuned_safetensors_model(self.finetuned_model_dir) is not None:
+            ok_st, st_summary, st_model = generate_summary_with_safetensors(
+                title=title.strip(),
+                content=cleaned_body,
+                max_new_tokens=max_tokens,
+                model_dir=self.finetuned_model_dir,
+            )
+            if ok_st and st_summary:
+                summary_clean = re.sub(r"^(\*\*요약\*\*|요약\s*[:：]|#+\s*요약)\s*", "", st_summary).strip()
+                summary_clean = re.sub(r"\s+", " ", summary_clean)
+                elapsed = round((time.perf_counter() - t0) * 1000, 1)
+                return {
+                    "summary": summary_clean,
+                    "model": st_model,
+                    "elapsed_ms": elapsed,
+                    "used_slm": True,
+                }
+
+        # 2순위: 로컬 OpenAI 호환 SLM 서버(8891/8889 등) 연동
         server_ok = self.ensure_local_slm_server()
         if server_ok:
             try:
@@ -390,7 +418,7 @@ class LocalKananaSummarizer:
         }
 
     def get_summary_stats(self) -> dict[str, Any]:
-        """news.db 내 전체 기사 수 및 요약 완료 현황 통계를 반환합니다."""
+        """news.db 내 전체 기사 수, 요약 완료 현황 및 파인튜닝된 model.safetensors 정보를 반환합니다."""
         with connect_summary_db(self.db_path) as con:
             cur = con.cursor()
             total = cur.execute("SELECT COUNT(*) FROM NEWS").fetchone()[0]
@@ -398,8 +426,9 @@ class LocalKananaSummarizer:
                 "SELECT COUNT(*) FROM NEWS WHERE SUMMARY IS NOT NULL AND TRIM(SUMMARY) != ''"
             ).fetchone()[0]
             slm_count = cur.execute(
-                "SELECT COUNT(*) FROM NEWS WHERE SUMMARY_MODEL LIKE '%kanana%' OR SUMMARY_MODEL LIKE '%GGUF%'"
+                "SELECT COUNT(*) FROM NEWS WHERE SUMMARY_MODEL LIKE '%kanana%' OR SUMMARY_MODEL LIKE '%safetensors%' OR SUMMARY_MODEL LIKE '%GGUF%'"
             ).fetchone()[0]
+        ft_info = get_finetuned_summarizer_info(self.finetuned_model_dir)
         return {
             "total_news": total,
             "summarized_news": summarized,
@@ -407,7 +436,8 @@ class LocalKananaSummarizer:
             "remaining_news": max(0, total - summarized),
             "progress_pct": round(summarized * 100.0 / max(1, total), 1),
             "model": self.model_id,
-            "slm_server_online": self.is_llm_server_online(),
+            "finetuned_safetensors": ft_info,
+            "slm_server_online": ft_info["exists"] or self.is_llm_server_online(),
             "slm_base_url": self.base_url,
         }
 
