@@ -22,11 +22,14 @@ import time
 from typing import Any
 import urllib.request
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore
 
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = ROOT_DIR / ".env"
-if ENV_FILE.exists():
+if ENV_FILE.exists() and load_dotenv is not None:
     load_dotenv(ENV_FILE)
 
 FINETUNED_SUMMARIZER_DIR = ROOT_DIR / os.environ.get(
@@ -40,9 +43,15 @@ DEFAULT_MODEL_REPO = os.environ.get(
 DEFAULT_GGUF_FILENAME = "kanana-nano-2.1b-instruct-q8_0.gguf"
 DEFAULT_LLAMA_SERVER_PORT = int(os.environ.get("LLAMA_SERVER_PORT", "8891"))
 DEFAULT_LLAMA_BASE_URL = f"http://127.0.0.1:{DEFAULT_LLAMA_SERVER_PORT}/v1"
-DEFAULT_API_KEY = os.environ.get("UNSLOTH_API_KEY", "").strip()
 
 _SAFETENSORS_PIPELINE_CACHE: dict[str, Any] | None = None
+
+
+def get_env_unsloth_api_key() -> str:
+    """.env 파일에서 UNSLOTH_API_KEY만 읽어 반환합니다."""
+    if ENV_FILE.exists() and load_dotenv is not None:
+        load_dotenv(ENV_FILE, override=False)
+    return os.environ.get("UNSLOTH_API_KEY", "").strip()
 
 
 def find_finetuned_safetensors_model(
@@ -144,15 +153,15 @@ def load_finetuned_safetensors_pipeline(
         return None
 
 
-def generate_summary_with_safetensors(
-    title: str,
-    content: str,
-    max_new_tokens: int = 180,
+def generate_chat_with_safetensors(
+    messages: list[dict[str, str]],
+    max_new_tokens: int = 240,
     model_dir: str | Path = FINETUNED_SUMMARIZER_DIR,
 ) -> tuple[bool, str, str]:
     """
-    파인튜닝된 `kanana_summarizer_full_ft_model/model.safetensors` 모델을 사용하여 뉴스 요약을 생성합니다.
-    반환값: (성공 여부, 생성된 요약 텍스트, 사용된 모델 식별자)
+    파인튜닝된 `kanana_summarizer_full_ft_model/model.safetensors` 모델이 존재하면
+    이를 사용하여 채팅 프롬프트 추론을 수행합니다.
+    반환값: (성공 여부, 생성된 응답 텍스트, 사용된 모델 식별자)
     """
     bundle = load_finetuned_safetensors_pipeline(model_dir)
     if bundle is None:
@@ -164,20 +173,6 @@ def generate_summary_with_safetensors(
         tokenizer = bundle["tokenizer"]
         model = bundle["model"]
         device = bundle["device"]
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "너는 한국어 뉴스 기사를 정확하고 간결하게 요약하는 AI 요약기야. "
-                    "기사에 없는 내용은 절대 지어내지 말고, 핵심 사실과 요지를 한국어 2~3문장으로만 요약해."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"[제목] {title}\n[본문]\n{content}\n\n위 기사의 핵심 내용을 2~3문장으로 요약해 줘.",
-            },
-        ]
 
         prompt_text = tokenizer.apply_chat_template(
             messages,
@@ -197,13 +192,43 @@ def generate_summary_with_safetensors(
             )
 
         gen_tokens = outputs[0][input_len:]
-        summary_text = tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
-        if summary_text:
-            return True, summary_text, "kanana_summarizer_full_ft_model (model.safetensors)"
+        out_text = tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+        if out_text:
+            return True, out_text, "kanana_summarizer_full_ft_model (model.safetensors)"
     except Exception as e:
         print(f"[경고] model.safetensors 추론 실패: {e}")
 
     return False, "", ""
+
+
+def generate_summary_with_safetensors(
+    title: str,
+    content: str,
+    max_new_tokens: int = 180,
+    model_dir: str | Path = FINETUNED_SUMMARIZER_DIR,
+) -> tuple[bool, str, str]:
+    """
+    파인튜닝된 `kanana_summarizer_full_ft_model/model.safetensors` 모델을 사용하여 뉴스 요약을 생성합니다.
+    반환값: (성공 여부, 생성된 요약 텍스트, 사용된 모델 식별자)
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "너는 한국어 뉴스 기사를 정확하고 간결하게 요약하는 AI 요약기야. "
+                "기사에 없는 내용은 절대 지어내지 말고, 핵심 사실과 요지를 한국어 2~3문장으로만 요약해."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"[제목] {title}\n[본문]\n{content}\n\n위 기사의 핵심 내용을 2~3문장으로 요약해 줘.",
+        },
+    ]
+    return generate_chat_with_safetensors(
+        messages=messages,
+        max_new_tokens=max_new_tokens,
+        model_dir=model_dir,
+    )
 
 
 def find_local_gguf_path(repo_id: str = DEFAULT_MODEL_REPO, filename: str = DEFAULT_GGUF_FILENAME) -> Path | None:
@@ -241,12 +266,13 @@ def find_llama_server_exe() -> Path | None:
     return None
 
 
-def probe_openai_models_url(base_url: str, api_key: str = DEFAULT_API_KEY) -> bool:
+def probe_openai_models_url(base_url: str) -> bool:
     """
     해당 base_url의 /models 엔드포인트가 실제 모델이 적재된 OpenAI 호환 JSON을 반환하는지 검사합니다.
     """
     models_url = f"{base_url.rstrip('/')}/models"
     try:
+        api_key = get_env_unsloth_api_key()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         req = urllib.request.Request(
             models_url,
@@ -282,7 +308,6 @@ def find_free_port(preferred_ports: tuple[int, ...] = (8891, 8892, 11435)) -> in
 
 def start_optimized_llama_server(
     model_id: str = DEFAULT_MODEL_REPO,
-    api_key: str = DEFAULT_API_KEY,
     n_gpu_layers: int = 99,
     ctx_size: int = 2048,
 ) -> tuple[subprocess.Popen | None, str | None]:
@@ -356,7 +381,7 @@ def start_optimized_llama_server(
         while time.time() - start_wait < 25.0:
             if proc.poll() is not None:
                 break
-            if probe_openai_models_url(target_base_url, api_key):
+            if probe_openai_models_url(target_base_url):
                 print(f"[SLM 준비 완료] {model_id} 서버가 {target_base_url} 에서 응답 중입니다.")
                 return proc, target_base_url
             time.sleep(0.5)
@@ -378,10 +403,11 @@ __all__ = [
     "DEFAULT_GGUF_FILENAME",
     "DEFAULT_LLAMA_SERVER_PORT",
     "DEFAULT_LLAMA_BASE_URL",
-    "DEFAULT_API_KEY",
+    "get_env_unsloth_api_key",
     "find_finetuned_safetensors_model",
     "get_finetuned_summarizer_info",
     "load_finetuned_safetensors_pipeline",
+    "generate_chat_with_safetensors",
     "generate_summary_with_safetensors",
     "find_local_gguf_path",
     "find_llama_server_exe",

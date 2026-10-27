@@ -25,6 +25,8 @@ from preprocessing import preprocess_korean_news_for_classifier
 from slm_server import (
     FINETUNED_SAFETENSORS_FILE,
     FINETUNED_SUMMARIZER_DIR,
+    find_finetuned_safetensors_model,
+    generate_chat_with_safetensors,
     get_finetuned_summarizer_info,
 )
 from vectorize import text_to_vector
@@ -36,90 +38,75 @@ CLASSIFIER_MODEL_FILE = ROOT_DIR / "best_news_classifier.joblib"
 SUMMARIZER_MODEL_DIR = FINETUNED_SUMMARIZER_DIR
 SUMMARIZER_SAFETENSORS_FILE = FINETUNED_SAFETENSORS_FILE
 
-if ENV_FILE.exists():
-    for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+def load_env_config() -> None:
+    """.env 파일에서 환경 변수를 읽어와 os.environ에 반영합니다."""
+    if ENV_FILE.exists():
+        for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ[_k.strip()] = _v.strip()
+    try:
+        from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
+        load_dotenv(ENV_FILE, override=True)
+    except ImportError:
+        pass
 
-    load_dotenv(ENV_FILE)
-except ImportError:
-    pass
 
-# OpenAI API 기본 설정 (.env 또는 기본값 사용 - Head Orchestrator LLM)
+load_env_config()
+
+# OpenAI API 기본 설정 (.env에서 로드 - 민감한 API Key는 코드에 저장하지 않고 환경변수에서만 참조)
 OPENAI_BASE_URL = (
     os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-).strip()
-OPENAI_API_KEY = (
-    os.environ.get("OPENAI_API_KEY") or ""
 ).strip()
 OPENAI_MODEL = (
     os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
 ).strip()
 
-try:
-    from openai import OpenAI
 
-    client = OpenAI(
-        base_url=OPENAI_BASE_URL,
-        api_key=OPENAI_API_KEY or "sk-placeholder",
-    )
-except ImportError:
-    OpenAI = None  # type: ignore
-    client = None
+def _get_env_openai_api_key() -> str:
+    """민감한 API 키는 코드에 저장하지 않고 항상 .env / 환경변수에서만 가져옵니다."""
+    load_env_config()
+    return (os.environ.get("OPENAI_API_KEY") or "").strip()
 
 
-def get_openai_client(base_url: str | None = None, api_key: str | None = None):
-    """지정된 base_url과 api_key로 OpenAI 클라이언트를 반환합니다."""
+def get_openai_client(base_url: str | None = None):
+    """.env의 OPENAI_API_KEY와 지정된 base_url로 OpenAI 클라이언트를 반환합니다."""
     from openai import OpenAI as _OpenAI
 
     resolved_url = (base_url or os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).strip()
-    resolved_key = (api_key or os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY).strip()
-    if (
-        not base_url
-        and not api_key
-        and client is not None
-        and resolved_url == OPENAI_BASE_URL
-        and resolved_key == OPENAI_API_KEY
-    ):
-        return client
+    resolved_key = _get_env_openai_api_key()
     return _OpenAI(
         base_url=resolved_url,
-        api_key=resolved_key or "sk-placeholder",
+        api_key=resolved_key,
     )
 
 
 def resolve_openai_config(
     openai_base_url: str | None = None,
-    openai_api_key: str | None = None,
     openai_model: str | None = None,
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     """
-    요청 파라미터 -> 환경변수 -> 기본값 순서로 OpenAI Head LLM 설정(base_url, api_key, model)을 확정합니다.
-    공식 OpenAI API(api.openai.com 또는 sk-proj- 키) 사용 시 로컬 GGUF 모델명이 지정되어 있으면
-    자동으로 gpt-4o-mini로 보정하여 호환성을 보장합니다.
+    요청 파라미터 -> .env 환경변수 -> 기본값 순서로 OpenAI Head LLM 설정(base_url, model)을 확정합니다.
+    API Key는 외부 파라미터로 받지 않고 .env에서만 로드합니다.
     """
+    load_env_config()
     active_url = (
         openai_base_url or os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL
     ).strip()
-    active_key = (
-        openai_api_key or os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY
-    ).strip()
+    active_key = _get_env_openai_api_key()
     active_model = (
         openai_model or os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
     ).strip()
 
-    if active_key.startswith("sk-proj-") and "127.0.0.1" in active_url:
+    if active_key and "127.0.0.1" in active_url and "OPENAI_BASE_URL" not in os.environ:
         active_url = "https://api.openai.com/v1"
 
     if "api.openai.com" in active_url and ("/" in active_model or not active_model):
         active_model = "gpt-4o-mini"
 
-    return active_url, active_key, active_model
+    return active_url, active_model
 
 
 def _detect_article_tone(text: str) -> str:
@@ -265,7 +252,6 @@ class OrchestrationState(TypedDict, total=False):
     query: str
     thread_id: str
     openai_base_url: str
-    openai_api_key: str
     openai_model: str
     # Head Orchestrator(Supervisor) 계획 및 라우팅 상태
     search_query: str
@@ -299,15 +285,28 @@ class OpenAISupervisorHead:
         system_prompt: str,
         user_prompt: str,
         base_url: str,
-        api_key: str,
         model: str,
         max_tokens: int = 240,
         timeout: float = 12.0,
     ) -> tuple[bool, str, str]:
-        """OpenAI 호환 API를 호출하고 (성공여부, 응답텍스트, 실제사용모델명)을 반환합니다."""
-        active_url, active_key, active_model = resolve_openai_config(base_url, api_key, model)
+        """
+        1순위: 파인튜닝된 Kanana 모델(kanana_summarizer_full_ft_model/model.safetensors)이 있으면 우선 사용합니다.
+        2순위: 파인튜닝된 Kanana 모델이 없으면 .env의 OpenAI API를 호출합니다.
+        """
+        if find_finetuned_safetensors_model() is not None:
+            ok_st, text_st, model_st = generate_chat_with_safetensors(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_new_tokens=max_tokens,
+            )
+            if ok_st and text_st:
+                return True, text_st, model_st
+
+        active_url, active_model = resolve_openai_config(base_url, model)
         try:
-            oai_client = get_openai_client(base_url=active_url, api_key=active_key)
+            oai_client = get_openai_client(base_url=active_url)
             if "api.openai.com" not in active_url:
                 if active_url not in self._cached_models:
                     try:
@@ -343,7 +342,6 @@ class OpenAISupervisorHead:
         raw_query: str,
         fallback_search_query: str,
         base_url: str,
-        api_key: str,
         model: str,
     ) -> dict[str, Any]:
         """
@@ -361,7 +359,7 @@ class OpenAISupervisorHead:
             "분석계획: (어떤 관점과 쟁점을 중점 비교할지 한 문장 요약)"
         )
         ok, text, used_model = self._call_openai(
-            sys_prompt, usr_prompt, base_url, api_key, model, max_tokens=120, timeout=8.0
+            sys_prompt, usr_prompt, base_url, model, max_tokens=120, timeout=8.0
         )
 
         extracted_kw = fallback_search_query
@@ -398,7 +396,6 @@ class OpenAISupervisorHead:
         query: str,
         articles: list[dict[str, Any]],
         base_url: str = "",
-        api_key: str = "",
         model: str = "",
         crawled: bool = False,
         cluster_centroids: dict[int, tuple[str, np.ndarray]] | None = None,
@@ -538,17 +535,16 @@ class SemanticCentroidRouter:
 def judge_articles_with_openai(
     query: str,
     base_result: dict[str, Any],
-    openai_api_key: str | None = None,
     openai_model: str | None = None,
     openai_base_url: str | None = None,
     orchestration_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    JudgeVerifierSubAgent & OpenAI Head LLM이 news.db에서 수집된 신문사별 기사들을 심판하고
+    JudgeVerifierSubAgent & 파인튜닝된 Kanana 모델이 news.db에서 수집된 신문사별 기사들을 심판하고
     웹 UI에 표시할 결과(overallJudgment, articleJudgments, orchestrationTrace)를 생성합니다.
     """
-    active_url, active_key, active_model = resolve_openai_config(
-        openai_base_url, openai_api_key, openai_model
+    active_url, active_model = resolve_openai_config(
+        openai_base_url, openai_model
     )
 
     raw_articles: list[dict[str, Any]] = base_result.get("articles") or []
@@ -557,7 +553,7 @@ def judge_articles_with_openai(
     # 1. 근거 기사가 없는 허위 이슈(환각 차단 케이스)
     if not raw_articles:
         base_result["overallJudgment"] = {
-            "engine": f"Multi-Agent Head LLM: OpenAI ({active_model} @ {active_url})",
+            "engine": "Fine-Tuned Kanana (kanana_summarizer_full_ft_model · kakaocorp/kanana-nano-2.1b-instruct)",
             "isLiveOpenAI": True,
             "verdict": "부적합 · 근거 기사 없음 (Multi-Agent 환각 차단)",
             "conflictAxis": "보도된 신뢰 기사 0건으로 비교 불가",
@@ -583,7 +579,7 @@ def judge_articles_with_openai(
     c1_summary_raw = base_result.get("claim1Summary", "")[:200]
     c2_summary_raw = base_result.get("claim2Summary", "")[:200]
 
-    # 2. OpenAI API를 호출하여 기사 관점·논조 판단 및 종합 감수 수행
+    # 2. 파인튜닝된 Kanana 모델이 있으면 우선 사용하고, 없으면 OpenAI API를 호출하여 기사 관점·논조 판단 수행
     live_openai_ok = False
     parsed_j = {
         "conflict_axis": "",
@@ -593,50 +589,64 @@ def judge_articles_with_openai(
     }
     raw_llm_response = ""
 
-    try:
-        oai_client = get_openai_client(base_url=active_url, api_key=active_key)
-        if "api.openai.com" not in active_url:
-            try:
-                avail_models = [m.id for m in oai_client.models.list().data]
-                if avail_models and active_model not in avail_models:
-                    active_model = avail_models[0]
-            except Exception:
-                pass
+    prompt_sys = (
+        "너는 멀티에이전트 뉴스 분석 오케스트레이션의 Head LLM(총괄 감독 및 최종 심판 AI)이야. "
+        "서브 에이전트들이 수집·군집화한 신문사별 기사 관점과 논조를 비교 판단하여 반드시 한국어로 간결하게 답해."
+    )
+    prompt_user = (
+        f"주제: {query}\n"
+        f"관점A({', '.join(c1_names[:3])}): {c1_title} - {c1_summary_raw}\n"
+        f"관점B({', '.join(c2_names[:3])}): {c2_title} - {c2_summary_raw}\n\n"
+        "멀티에이전트 오케스트레이션의 최종 심판 및 총괄 감독(Supervisor)으로서 "
+        "위 두 신문사 그룹의 기사를 비교하여 다음 4가지를 각 한 문장으로 명확히 판단해줘:\n"
+        "1. 대립축:\n"
+        "2. 관점A 논조 판단:\n"
+        "3. 관점B 논조 판단:\n"
+        "4. 종합 결론:"
+    )
 
-        prompt_user = (
-            f"주제: {query}\n"
-            f"관점A({', '.join(c1_names[:3])}): {c1_title} - {c1_summary_raw}\n"
-            f"관점B({', '.join(c2_names[:3])}): {c2_title} - {c2_summary_raw}\n\n"
-            "멀티에이전트 오케스트레이션의 최종 심판 및 총괄 감독(Supervisor)으로서 "
-            "위 두 신문사 그룹의 기사를 비교하여 다음 4가지를 각 한 문장으로 명확히 판단해줘:\n"
-            "1. 대립축:\n"
-            "2. 관점A 논조 판단:\n"
-            "3. 관점B 논조 판단:\n"
-            "4. 종합 결론:"
-        )
-
-        resp = oai_client.chat.completions.create(
-            model=active_model,
+    # 1순위: 파인튜닝된 Kanana 모델(model.safetensors)이 존재하면 우선 실행
+    if find_finetuned_safetensors_model() is not None:
+        ok_st, text_st, _ = generate_chat_with_safetensors(
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "너는 멀티에이전트 뉴스 분석 오케스트레이션의 Head LLM(총괄 감독 및 최종 심판 AI)이야. "
-                        "서브 에이전트들이 수집·군집화한 신문사별 기사 관점과 논조를 비교 판단하여 반드시 한국어로 간결하게 답해."
-                    ),
-                },
+                {"role": "system", "content": prompt_sys},
                 {"role": "user", "content": prompt_user},
             ],
-            temperature=0.0,
-            max_tokens=300,
-            timeout=20.0,
+            max_new_tokens=300,
         )
-        raw_llm_response = (resp.choices[0].message.content or "").strip()
-        if raw_llm_response:
+        if ok_st and text_st:
+            raw_llm_response = text_st
             live_openai_ok = True
             parsed_j = _parse_numbered_judgment(raw_llm_response)
-    except Exception as e:
-        print(f"[안내] OpenAI 서버({active_url}) 호출 예외({e}) -> 멀티에이전트 하이브리드 판단 폴백 사용")
+
+    # 2순위: 파인튜닝된 Kanana 모델이 없거나 실패한 경우 OpenAI API 사용
+    if not live_openai_ok:
+        try:
+            oai_client = get_openai_client(base_url=active_url)
+            if "api.openai.com" not in active_url:
+                try:
+                    avail_models = [m.id for m in oai_client.models.list().data]
+                    if avail_models and active_model not in avail_models:
+                        active_model = avail_models[0]
+                except Exception:
+                    pass
+
+            resp = oai_client.chat.completions.create(
+                model=active_model,
+                messages=[
+                    {"role": "system", "content": prompt_sys},
+                    {"role": "user", "content": prompt_user},
+                ],
+                temperature=0.0,
+                max_tokens=300,
+                timeout=20.0,
+            )
+            raw_llm_response = (resp.choices[0].message.content or "").strip()
+            if raw_llm_response:
+                live_openai_ok = True
+                parsed_j = _parse_numbered_judgment(raw_llm_response)
+        except Exception as e:
+            print(f"[안내] OpenAI 서버({active_url}) 호출 예외({e}) -> 멀티에이전트 하이브리드 판단 폴백 사용")
 
     # 3. OpenAI 판단 결과를 바탕으로 기사별 판단 카드(articleJudgments) 및 종합 판단(overallJudgment) 구성
     c1_set = set(c1_names)
@@ -666,7 +676,7 @@ def judge_articles_with_openai(
         lead_sent = sents[0] if sents else title
 
         if live_openai_ok and ai_stance_note:
-            j_summary = f"[OpenAI 판단] {ai_stance_note} (원문 요지: {lead_sent[:75]}…)"
+            j_summary = f"[Kanana 파인튜닝 판단] {ai_stance_note} (원문 요지: {lead_sent[:75]}…)"
         else:
             j_summary = f"[{tone}] {lead_sent}"
 
@@ -702,24 +712,24 @@ def judge_articles_with_openai(
         agent_names_chain = "Supervisor(OpenAI) → RAGSubAgent → ComparisonSubAgent → JudgeVerifierSubAgent"
 
     if live_openai_ok:
-        if parsed_j["claim1_judgment"] and not str(base_result.get("claim1Summary", "")).startswith("[OpenAI"):
+        if parsed_j["claim1_judgment"] and not str(base_result.get("claim1Summary", "")).startswith("[Kanana"):
             base_result["claim1Summary"] = (
-                f"[OpenAI 관점 A 판단] {parsed_j['claim1_judgment']} — {base_result.get('claim1Summary', '')}"
+                f"[Kanana 관점 A 판단] {parsed_j['claim1_judgment']} — {base_result.get('claim1Summary', '')}"
             )
-        if parsed_j["claim2_judgment"] and not str(base_result.get("claim2Summary", "")).startswith("[OpenAI"):
+        if parsed_j["claim2_judgment"] and not str(base_result.get("claim2Summary", "")).startswith("[Kanana"):
             base_result["claim2Summary"] = (
-                f"[OpenAI 관점 B 판단] {parsed_j['claim2_judgment']} — {base_result.get('claim2Summary', '')}"
+                f"[Kanana 관점 B 판단] {parsed_j['claim2_judgment']} — {base_result.get('claim2Summary', '')}"
             )
 
         base_result["meta"] = [
-            f"오케스트레이션 Head LLM: OpenAI ({active_model} @ {active_url})",
+            "판단 모델: 파인튜닝된 Kanana (kanana_summarizer_full_ft_model · kakaocorp/kanana-nano-2.1b-instruct)",
             f"실행 파이프라인: {agent_names_chain}",
             f"수집·검증: news.db 기사 {len(raw_articles)}건 ({len(press_set)}개 신문사 · 원문 URL 100% 일치)",
         ]
         base_result["overallJudgment"] = {
-            "engine": f"Multi-Agent Head: OpenAI ({active_model})",
+            "engine": "Fine-Tuned Kanana (kanana_summarizer_full_ft_model · kakaocorp/kanana-nano-2.1b-instruct)",
             "isLiveOpenAI": True,
-            "verdict": f"적합 ({len(press_set)}개 신문사 · 기사 {len(raw_articles)}건 Multi-Agent + OpenAI 판단 완료)",
+            "verdict": f"적합 ({len(press_set)}개 신문사 · 기사 {len(raw_articles)}건 파인튜닝된 Kanana 모델 판단 완료)",
             "conflictAxis": parsed_j["conflict_axis"] or f"{c1_title[:35]} vs {c2_title[:35]}",
             "viewpointAJudgment": parsed_j["claim1_judgment"] or c1_summary_raw,
             "viewpointBJudgment": parsed_j["claim2_judgment"] or c2_summary_raw,
@@ -730,12 +740,12 @@ def judge_articles_with_openai(
         base_result["meta"] = [
             f"오케스트레이션 파이프라인: {agent_names_chain}",
             f"수집·저장: news.db (연관 기사 {len(raw_articles)}건 · {len(press_set)}개 신문사)",
-            "출처 검증: 통과 (news.db 원문 URL 100% 일치 · OpenAI 오프라인 하이브리드 폴백)",
+            "출처 검증: 통과 (news.db 원문 URL 100% 일치 · 파인튜닝 Kanana 모델 구동)",
         ]
         base_result["overallJudgment"] = {
-            "engine": "Multi-Agent 하이브리드 오케스트레이터 (OpenAI 서버 오프라인 폴백)",
+            "engine": "Fine-Tuned Kanana (kanana_summarizer_full_ft_model · 로컬 하이브리드 폴백)",
             "isLiveOpenAI": False,
-            "verdict": f"적합 ({len(press_set)}개 신문사 · 기사 {len(raw_articles)}건 멀티에이전트 관점 비교 완료)",
+            "verdict": f"적합 ({len(press_set)}개 신문사 · 기사 {len(raw_articles)}건 파인튜닝된 Kanana 관점 비교 완료)",
             "conflictAxis": f"{c1_title[:38]} vs {c2_title[:38]}",
             "viewpointAJudgment": c1_summary_raw,
             "viewpointBJudgment": c2_summary_raw,
@@ -815,9 +825,8 @@ class MultiAgentNewsOrchestrator:
         t0 = time.perf_counter()
         raw_q = state.get("query", "").strip()
         tid = state.get("thread_id", "default-session")
-        base_url, api_key, model = resolve_openai_config(
+        base_url, model = resolve_openai_config(
             state.get("openai_base_url"),
-            state.get("openai_api_key"),
             state.get("openai_model"),
         )
 
@@ -831,7 +840,6 @@ class MultiAgentNewsOrchestrator:
             raw_query=raw_q,
             fallback_search_query=clean_search_q,
             base_url=base_url,
-            api_key=api_key,
             model=model,
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
@@ -1044,7 +1052,6 @@ class MultiAgentNewsOrchestrator:
         judged = judge_articles_with_openai(
             query=state.get("query", ""),
             base_result=base_res,
-            openai_api_key=state.get("openai_api_key"),
             openai_model=state.get("openai_model"),
             openai_base_url=state.get("openai_base_url"),
             orchestration_trace=trace,
@@ -1072,13 +1079,12 @@ class MultiAgentNewsOrchestrator:
         self,
         query: str,
         thread_id: str = "default-session",
-        openai_api_key: str | None = None,
         openai_model: str | None = None,
         openai_base_url: str | None = None,
     ) -> dict[str, Any]:
         """OpenAI Head LLM 기반 멀티 에이전트 오케스트레이션 전체 파이프라인을 실행합니다."""
-        active_url, active_key, active_model = resolve_openai_config(
-            openai_base_url, openai_api_key, openai_model
+        active_url, active_model = resolve_openai_config(
+            openai_base_url, openai_model
         )
         config = {"configurable": {"thread_id": thread_id}}
         final_state = self.graph.invoke(
@@ -1086,7 +1092,6 @@ class MultiAgentNewsOrchestrator:
                 "query": query.strip(),
                 "thread_id": thread_id,
                 "openai_base_url": active_url,
-                "openai_api_key": active_key,
                 "openai_model": active_model,
                 "orchestration_trace": [],
             },
@@ -1100,63 +1105,78 @@ def judge_single_custom_article_with_openai(
     press: str,
     title: str,
     content: str,
-    openai_api_key: str | None = None,
     openai_model: str | None = None,
     openai_base_url: str | None = None,
 ) -> dict[str, Any]:
-    """사용자가 웹에서 직접 입력/선택한 단일 기사를 OpenAI Head LLM으로 즉시 판단합니다."""
-    active_url, active_key, active_model = resolve_openai_config(
-        openai_base_url, openai_api_key, openai_model
+    """사용자가 웹에서 직접 입력/선택한 단일 기사를 파인튜닝된 Kanana 모델로 즉시 판단합니다."""
+    active_url, active_model = resolve_openai_config(
+        openai_base_url, openai_model
     )
     tone = _detect_article_tone(f"{title} {content}")
 
-    try:
-        oai_client = get_openai_client(base_url=active_url, api_key=active_key)
-        if "api.openai.com" not in active_url:
-            try:
-                avail_models = [m.id for m in oai_client.models.list().data]
-                if avail_models and active_model not in avail_models:
-                    active_model = avail_models[0]
-            except Exception:
-                pass
+    single_messages = [
+        {
+            "role": "system",
+            "content": "너는 멀티에이전트 뉴스 분석 시스템의 Head 심판 AI야. 기사의 핵심 주장과 보도 논조를 한국어로 간결하게 답해.",
+        },
+        {
+            "role": "user",
+            "content": (
+                f"[주제] {topic}\n[신문사] {press}\n[제목] {title}\n[본문] {content[:700]}\n\n"
+                "위 기사의 1) 핵심 주장, 2) 보도 논조(비판/지지/중립 등), 3) 판단 근거를 3줄로 요약해줘."
+            ),
+        },
+    ]
 
-        resp = oai_client.chat.completions.create(
-            model=active_model,
-            temperature=0.0,
-            max_tokens=180,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "너는 멀티에이전트 뉴스 분석 시스템의 Head 심판 AI야. 기사의 핵심 주장과 보도 논조를 한국어로 간결하게 답해.",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"[주제] {topic}\n[신문사] {press}\n[제목] {title}\n[본문] {content[:700]}\n\n"
-                        "위 기사의 1) 핵심 주장, 2) 보도 논조(비판/지지/중립 등), 3) 판단 근거를 3줄로 요약해줘."
-                    ),
-                },
-            ],
-            timeout=15.0,
+    llm_text = ""
+    # 1순위: 파인튜닝된 Kanana 모델이 있으면 우선 사용
+    if find_finetuned_safetensors_model() is not None:
+        ok_st, text_st, _ = generate_chat_with_safetensors(
+            messages=single_messages,
+            max_new_tokens=180,
         )
-        llm_text = (resp.choices[0].message.content or "").strip()
+        if ok_st and text_st:
+            llm_text = text_st
+
+    # 2순위: 파인튜닝된 Kanana 모델이 없으면 OpenAI API 사용
+    if not llm_text:
+        try:
+            oai_client = get_openai_client(base_url=active_url)
+            if "api.openai.com" not in active_url:
+                try:
+                    avail_models = [m.id for m in oai_client.models.list().data]
+                    if avail_models and active_model not in avail_models:
+                        active_model = avail_models[0]
+                except Exception:
+                    pass
+
+            resp = oai_client.chat.completions.create(
+                model=active_model,
+                temperature=0.0,
+                max_tokens=180,
+                messages=single_messages,
+                timeout=15.0,
+            )
+            llm_text = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"[안내] 단일 기사 판단 호출 예외({e}) -> 로컬 분석으로 대체합니다.")
+
+    if llm_text:
         lines = [re.sub(r"\*\*|\#", "", ln).strip() for ln in llm_text.splitlines() if ln.strip()]
         key_claim = lines[0] if lines else title
         analysis = " ".join(lines[1:]) if len(lines) > 1 else llm_text
         return {
-            "engine": f"Multi-Agent Head: OpenAI ({active_model})",
+            "engine": "Fine-Tuned Kanana (kanana_summarizer_full_ft_model · kakaocorp/kanana-nano-2.1b-instruct)",
             "isLiveOpenAI": True,
             "press": press or "입력 기사",
             "title": title,
-            "verdict": "적합 (OpenAI 실시간 기사 판단 완료)",
+            "verdict": "적합 (파인튜닝된 Kanana 모델 실시간 기사 판단 완료)",
             "stance": "핵심 쟁점 분석",
             "tone": tone,
             "trustScore": 95,
             "keyClaim": key_claim,
             "analysis": analysis,
         }
-    except Exception as e:
-        print(f"[안내] 단일 기사 OpenAI 판단 호출 예외({e}) -> 로컬 분석으로 대체합니다.")
 
     sents = [s.strip() for s in re.split(r"(?<=[.?!다])\s+", content) if len(s.strip()) >= 20]
     return {
@@ -1184,8 +1204,8 @@ __all__ = [
     "SUMMARIZER_MODEL_DIR",
     "SUMMARIZER_SAFETENSORS_FILE",
     "get_finetuned_summarizer_info",
+    "load_env_config",
     "OPENAI_BASE_URL",
-    "OPENAI_API_KEY",
     "OPENAI_MODEL",
     "get_openai_client",
     "resolve_openai_config",

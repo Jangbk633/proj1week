@@ -23,7 +23,6 @@ from typing import Any
 from preprocessing import clean_article_content
 from rag import DEFAULT_DB_PATH, ROOT_DIR
 from slm_server import (
-    DEFAULT_API_KEY,
     DEFAULT_GGUF_FILENAME,
     DEFAULT_LLAMA_BASE_URL,
     DEFAULT_LLAMA_SERVER_PORT,
@@ -34,13 +33,13 @@ from slm_server import (
     find_free_port,
     find_llama_server_exe,
     find_local_gguf_path,
+    get_env_unsloth_api_key,
     get_finetuned_summarizer_info,
     probe_openai_models_url,
     start_optimized_llama_server,
 )
 from summary_engine import (
     DEFAULT_RENDER_URL,
-    SUMMARY_SYNC_TOKEN,
     LocalKananaSummarizer,
     connect_summary_db,
     ensure_summary_columns,
@@ -368,7 +367,7 @@ def create_summary_app(summarizer: LocalKananaSummarizer | None = None):
             try:
                 from openai import OpenAI
 
-                client = OpenAI(base_url=engine.base_url, api_key=engine.api_key or "local-slm")
+                client = OpenAI(base_url=engine.base_url, api_key=get_env_unsloth_api_key())
                 resp = client.chat.completions.create(
                     model=engine.model_id,
                     messages=req.messages,  # type: ignore[arg-type]
@@ -504,10 +503,8 @@ __all__ = [
     "DEFAULT_GGUF_FILENAME",
     "DEFAULT_LLAMA_SERVER_PORT",
     "DEFAULT_LLAMA_BASE_URL",
-    "DEFAULT_API_KEY",
     "DEFAULT_SUMMARY_PORT",
     "DEFAULT_RENDER_URL",
-    "SUMMARY_SYNC_TOKEN",
     "clean_article_content",
     "connect_summary_db",
     "ensure_summary_columns",

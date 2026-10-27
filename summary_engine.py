@@ -25,7 +25,6 @@ import httpx
 from preprocessing import clean_article_content
 from rag import DEFAULT_DB_PATH
 from slm_server import (
-    DEFAULT_API_KEY,
     DEFAULT_GGUF_FILENAME,
     DEFAULT_LLAMA_BASE_URL,
     DEFAULT_LLAMA_SERVER_PORT,
@@ -37,13 +36,13 @@ from slm_server import (
     find_llama_server_exe,
     find_local_gguf_path,
     generate_summary_with_safetensors,
+    get_env_unsloth_api_key,
     get_finetuned_summarizer_info,
     probe_openai_models_url,
     start_optimized_llama_server,
 )
 
 DEFAULT_RENDER_URL = os.environ.get("RENDER_SERVICE_URL", "").strip()
-SUMMARY_SYNC_TOKEN = os.environ.get("SUMMARY_SYNC_TOKEN", "").strip()
 
 
 def connect_summary_db(db_path: str | Path = DEFAULT_DB_PATH, timeout: float = 15.0) -> sqlite3.Connection:
@@ -100,7 +99,6 @@ class LocalKananaSummarizer:
         db_path: str | Path = DEFAULT_DB_PATH,
         model_id: str = DEFAULT_MODEL_REPO,
         base_url: str = DEFAULT_LLAMA_BASE_URL,
-        api_key: str = DEFAULT_API_KEY,
         n_gpu_layers: int = 99,
         ctx_size: int = 2048,
         auto_start_server: bool = True,
@@ -109,7 +107,6 @@ class LocalKananaSummarizer:
         self.db_path = Path(db_path)
         self.model_id = model_id
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
         self.n_gpu_layers = n_gpu_layers
         self.ctx_size = ctx_size
         self.auto_start_server = auto_start_server
@@ -121,8 +118,8 @@ class LocalKananaSummarizer:
         atexit.register(self.stop_local_server)
 
     @staticmethod
-    def _probe_openai_models_url(base_url: str, api_key: str) -> bool:
-        return probe_openai_models_url(base_url, api_key)
+    def _probe_openai_models_url(base_url: str) -> bool:
+        return probe_openai_models_url(base_url)
 
     def is_llm_server_online(self) -> bool:
         """
@@ -140,7 +137,7 @@ class LocalKananaSummarizer:
             if c in seen:
                 continue
             seen.add(c)
-            if self._probe_openai_models_url(c, self.api_key):
+            if self._probe_openai_models_url(c):
                 self.base_url = c
                 return True
         return False
@@ -162,7 +159,6 @@ class LocalKananaSummarizer:
 
         proc, active_url = start_optimized_llama_server(
             model_id=self.model_id,
-            api_key=self.api_key,
             n_gpu_layers=self.n_gpu_layers,
             ctx_size=self.ctx_size,
         )
@@ -238,7 +234,7 @@ class LocalKananaSummarizer:
             try:
                 from openai import OpenAI
 
-                client = OpenAI(base_url=self.base_url, api_key=self.api_key or "local-slm")
+                client = OpenAI(base_url=self.base_url, api_key=get_env_unsloth_api_key())
                 active_model = self.model_id
                 try:
                     models = [m.id for m in client.models.list().data]
@@ -282,6 +278,55 @@ class LocalKananaSummarizer:
                     }
             except Exception as e:
                 print(f"[경고] Kanana SLM 요약 호출 오류 ({e}) -> 추출형 요약 폴백 사용")
+
+        # 3순위: 파인튜닝된 Kanana 모델 및 로컬 SLM 서버가 없을 때 .env의 OpenAI API로 요약 수행
+        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if openai_key:
+            try:
+                from openai import OpenAI
+
+                oai_url = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+                oai_model = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
+                if "api.openai.com" in oai_url and ("/" in oai_model or not oai_model):
+                    oai_model = "gpt-4o-mini"
+
+                oai_client = OpenAI(base_url=oai_url, api_key=openai_key)
+                resp = oai_client.chat.completions.create(
+                    model=oai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "너는 한국어 뉴스 기사를 정확하고 간결하게 요약하는 AI 요약기야. "
+                                "기사에 없는 내용은 절대 지어내지 말고, 핵심 사실과 요지를 한국어 2~3문장으로만 요약해."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"[기사 제목]\n{title.strip()}\n\n"
+                                f"[기사 본문]\n{cleaned_body}\n\n"
+                                "위 기사의 핵심 내용을 군더더기 없이 2~3문장으로 요약해줘:"
+                            ),
+                        },
+                    ],
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    timeout=30.0,
+                )
+                raw_summary = (resp.choices[0].message.content or "").strip()
+                summary_clean = re.sub(r"^(\*\*요약\*\*|요약\s*[:：]|#+\s*요약)\s*", "", raw_summary).strip()
+                summary_clean = re.sub(r"\s+", " ", summary_clean)
+                if summary_clean:
+                    elapsed = round((time.perf_counter() - t0) * 1000, 1)
+                    return {
+                        "summary": summary_clean,
+                        "model": oai_model,
+                        "elapsed_ms": elapsed,
+                        "used_slm": True,
+                    }
+            except Exception as e:
+                print(f"[경고] OpenAI 요약 폴백 호출 오류 ({e}) -> 추출형 요약 폴백 사용")
 
         fallback = self.fallback_extractive_summary(title, content)
         elapsed = round((time.perf_counter() - t0) * 1000, 1)
@@ -539,8 +584,9 @@ class LocalKananaSummarizer:
             return {"status": "empty", "pushed_count": 0, "target": endpoint}
 
         headers = {"Content-Type": "application/json"}
-        if SUMMARY_SYNC_TOKEN:
-            headers["X-Summary-Token"] = SUMMARY_SYNC_TOKEN
+        sync_token = os.environ.get("SUMMARY_SYNC_TOKEN", "").strip()
+        if sync_token:
+            headers["X-Summary-Token"] = sync_token
 
         try:
             resp = httpx.post(
@@ -570,7 +616,6 @@ class LocalKananaSummarizer:
 
 __all__ = [
     "DEFAULT_RENDER_URL",
-    "SUMMARY_SYNC_TOKEN",
     "connect_summary_db",
     "ensure_summary_columns",
     "clean_article_content",

@@ -13,13 +13,30 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from preprocessing import extract_keywords
-from rag import DEFAULT_DB_PATH, NewsDBRAG, RetrievedArticle
+from rag import DEFAULT_DB_PATH, ROOT_DIR, NewsDBRAG, RetrievedArticle
 from summerizer import ComparisonOutputSchema, _extractive_compare_articles
+
+ENV_FILE = ROOT_DIR / ".env"
+if ENV_FILE.exists():
+    for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+try:
+    from dotenv import load_dotenv
+
+    if ENV_FILE.exists():
+        load_dotenv(ENV_FILE, override=False)
+except ImportError:
+    pass
 
 
 class AgentState(TypedDict, total=False):
     query: str
     thread_id: str
+    use_openai: bool
     keywords: list[str]
     articles: list[dict[str, Any]]
     crawled_count: int
@@ -170,24 +187,59 @@ class NJKAgent:
         }
 
     def compare_and_summarize_node(self, state: AgentState) -> AgentState:
-        """검색·수집된 news.db 기사들을 하나의 헤드라인으로 묶어 요약하고 신문사별로 의견을 비교합니다."""
+        """
+        검색·수집된 news.db 기사들을 하나의 헤드라인으로 묶어 요약하고 신문사별로 의견을 비교합니다.
+        1순위: 파인튜닝된 Kanana 모델(kanana_summarizer_full_ft_model/model.safetensors)이 있으면 사용
+        2순위: 없으면 .env의 OpenAI API 사용
+        """
         query = state.get("query", "")
         raw_articles = state.get("articles") or []
         crawled_count = state.get("crawled_count") or 0
         articles = [RetrievedArticle(**a) for a in raw_articles]
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if api_key:
-            try:
-                from langchain_anthropic import ChatAnthropic
+        try:
+            from slm_server import find_finetuned_safetensors_model, generate_chat_with_safetensors
 
-                llm = ChatAnthropic(
-                    model=os.environ.get("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
-                    api_key=api_key,
-                    temperature=0.1,
-                    max_tokens=2048,
+            if find_finetuned_safetensors_model() is not None:
+                base_out = _extractive_compare_articles(query, articles, crawled_count=crawled_count)
+                brief_ctx = "\n".join(f"- [{a.press}] {a.title}: {a.content[:250]}" for a in articles[:6])
+                ok_st, kanana_summary, _ = generate_chat_with_safetensors(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "너는 여러 신문사의 기사를 종합해 핵심 쟁점과 관점 차이를 한국어 2~3문장으로 요약하는 AI야.",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"[주제] {query}\n[기사 목록]\n{brief_ctx}\n\n위 기사들의 공통 쟁점과 관점 차이를 2~3문장으로 요약해 줘.",
+                        },
+                    ],
+                    max_new_tokens=220,
                 )
-                structured_llm = llm.with_structured_output(ComparisonOutputSchema)
+                if ok_st and kanana_summary:
+                    press_set = sorted({a.press for a in articles})
+                    crawl_note = f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
+                    base_out["summary"] = kanana_summary
+                    base_out["meta"] = [
+                        f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
+                        "분석 모델: 파인튜닝된 Kanana (kanana_summarizer_full_ft_model · model.safetensors)",
+                        "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
+                    ]
+                    return {"result": base_out}
+        except Exception as e:
+            print(f"[안내] 파인튜닝된 Kanana 모델 호출 생략({e}) -> OpenAI API로 전환합니다.")
+
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if api_key and state.get("use_openai", True):
+            try:
+                from openai import OpenAI
+
+                base_url = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+                model = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
+                if "api.openai.com" in base_url and ("/" in model or not model):
+                    model = "gpt-4o-mini"
+
+                oai_client = OpenAI(base_url=base_url, api_key=api_key)
 
                 context_blocks = []
                 for idx, a in enumerate(articles, 1):
@@ -210,18 +262,36 @@ class NJKAgent:
                     f"[news.db 기사 목록]\n{context_text}"
                 )
 
-                parsed: ComparisonOutputSchema = structured_llm.invoke(prompt)
-                press_set = sorted({a.press for a in articles})
-                crawl_note = f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
-                out = parsed.model_dump()
-                out["meta"] = [
-                    f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
-                    "분석 모델: Anthropic Claude (LangGraph + sqlite-vec RAG)",
-                    "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
-                ]
-                return {"result": out}
+                completion = oai_client.beta.chat.completions.parse(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "당신은 여러 신문사의 기사를 하나의 헤드라인으로 묶어 요약하고 "
+                                "신문사별 해석·의견 차이를 비교해 주는 AI 에이전트입니다."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format=ComparisonOutputSchema,
+                    temperature=0.1,
+                    max_tokens=2048,
+                    timeout=25.0,
+                )
+                parsed = completion.choices[0].message.parsed
+                if parsed is not None:
+                    press_set = sorted({a.press for a in articles})
+                    crawl_note = f"실시간 크롤링 {crawled_count}건 추가 적재 + " if crawled_count > 0 else ""
+                    out = parsed.model_dump()
+                    out["meta"] = [
+                        f"수집·저장: {crawl_note}news.db (연관 기사 {len(articles)}건 · {len(press_set)}개 신문사)",
+                        f"분석 모델: OpenAI ({model} · LangGraph + sqlite-vec RAG)",
+                        "출처 검증: 통과 (news.db 원문 URL 100% 일치)",
+                    ]
+                    return {"result": out}
             except Exception as e:
-                print(f"[안내] Anthropic API 호출 실패({e}) -> news.db 추출형 비교 엔진으로 대체합니다.")
+                print(f"[안내] OpenAI API 호출 실패({e}) -> news.db 추출형 비교 엔진으로 대체합니다.")
 
         return {"result": _extractive_compare_articles(query, articles, crawled_count=crawled_count)}
 

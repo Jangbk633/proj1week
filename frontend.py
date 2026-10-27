@@ -11,35 +11,60 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Any
 import urllib.error
 import urllib.request
 import venv
 import webbrowser
 
-from backend import (
-    CLASSIFIER_MODEL_FILE,
-    DB_FILE,
-    ENV_FILE,
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
-    OPENAI_MODEL,
-    ROOT_DIR,
-    SUMMARIZER_MODEL_DIR,
-    SUMMARIZER_SAFETENSORS_FILE,
-    MultiAgentNewsOrchestrator,
-    OpenAISupervisorHead,
-    OrchestrationState,
-    _detect_article_tone,
-    _parse_numbered_judgment,
-    classify_news_with_exported_model,
-    get_finetuned_summarizer_info,
-    get_openai_client,
-    judge_articles_with_openai,
-    judge_single_custom_article_with_openai,
-    load_exported_news_classifier,
-    preprocess_korean_news_for_classifier,
-    resolve_openai_config,
-)
+ROOT_DIR = Path(__file__).resolve().parent
+ENV_FILE = ROOT_DIR / ".env"
+DB_FILE = ROOT_DIR / "news.db"
+CLASSIFIER_MODEL_FILE = ROOT_DIR / "best_news_classifier.joblib"
+
+if ENV_FILE.exists():
+    for _line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+OPENAI_BASE_URL = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
+SUMMARIZER_MODEL_DIR = ROOT_DIR / os.environ.get("SUMMARIZER_MODEL_DIR", "kanana_summarizer_full_ft_model").strip()
+SUMMARIZER_SAFETENSORS_FILE = SUMMARIZER_MODEL_DIR / "model.safetensors"
+
+# 가상환경(.venv) 생성 전 시스템 Python으로 `python frontend.py`를 처음 실행할 때
+# 서드파티 패키지(numpy, dotenv, sqlite_vec 등) 미설치로 인한 ImportError를 방지합니다.
+try:
+    from backend import (
+        CLASSIFIER_MODEL_FILE,
+        DB_FILE,
+        ENV_FILE,
+        OPENAI_BASE_URL,
+        OPENAI_MODEL,
+        ROOT_DIR,
+        SUMMARIZER_MODEL_DIR,
+        SUMMARIZER_SAFETENSORS_FILE,
+        MultiAgentNewsOrchestrator,
+        OpenAISupervisorHead,
+        OrchestrationState,
+        _detect_article_tone,
+        _parse_numbered_judgment,
+        classify_news_with_exported_model,
+        get_finetuned_summarizer_info,
+        get_openai_client,
+        judge_articles_with_openai,
+        judge_single_custom_article_with_openai,
+        load_env_config,
+        load_exported_news_classifier,
+        preprocess_korean_news_for_classifier,
+        resolve_openai_config,
+    )
+
+    _BACKEND_IMPORTED = True
+except ImportError:
+    _BACKEND_IMPORTED = False
 
 VENV_DIR = ROOT_DIR / ".venv"
 REQ_FILE = ROOT_DIR / "requirements.txt"
@@ -54,6 +79,18 @@ def create_fastapi_app():
     from fastapi import FastAPI
     from fastapi.responses import HTMLResponse
     from pydantic import BaseModel, Field
+    from backend import (
+        CLASSIFIER_MODEL_FILE,
+        DB_FILE,
+        MultiAgentNewsOrchestrator,
+        classify_news_with_exported_model,
+        get_finetuned_summarizer_info,
+        get_openai_client,
+        judge_single_custom_article_with_openai,
+        load_env_config,
+        load_exported_news_classifier,
+        resolve_openai_config,
+    )
     from mylggraph import NJKAgent
 
     app = FastAPI(
@@ -71,7 +108,6 @@ def create_fastapi_app():
     class AnalyzeRequest(BaseModel):
         query: str
         thread_id: str = "default-session"
-        openai_api_key: str | None = None
         openai_model: str | None = None
         openai_base_url: str | None = None
 
@@ -135,7 +171,6 @@ def create_fastapi_app():
 
     class OpenAIKeyRequest(BaseModel):
         base_url: str | None = None
-        api_key: str | None = None
         model: str | None = None
 
     class CustomArticleJudgeRequest(BaseModel):
@@ -143,7 +178,6 @@ def create_fastapi_app():
         press: str = ""
         title: str
         content: str
-        openai_api_key: str | None = None
         openai_model: str | None = None
         openai_base_url: str | None = None
 
@@ -160,7 +194,7 @@ def create_fastapi_app():
     @app.get("/api/orchestration-info")
     async def get_orchestration_info():
         """현재 구성된 Multi-Agent Orchestration 아키텍처 및 Head LLM 정보를 반환합니다."""
-        base_url, _, model = resolve_openai_config()
+        base_url, model = resolve_openai_config()
         return {
             "architecture": "LangGraph Supervisor Multi-Agent Orchestration",
             "head_llm": {
@@ -199,17 +233,22 @@ def create_fastapi_app():
 
     @app.get("/api/openai-status")
     async def get_openai_status():
-        """현재 연결된 OpenAI Head LLM 서버 상태 및 사용 가능한 모델 목록을 반환합니다."""
-        base_url, key, model = resolve_openai_config()
-        masked = f"{key[:11]}...{key[-4:]}" if len(key) > 15 else ("설정됨" if key else "미설정")
+        """.env에서 로드된 OpenAI Head LLM 서버 상태 및 사용 가능한 모델 목록을 반환합니다."""
+        load_env_config()
+        base_url, model = resolve_openai_config()
+        has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
 
         available_models: list[str] = []
         server_online = False
-        try:
-            oai = get_openai_client(base_url=base_url, api_key=key)
-            available_models = [m.id for m in oai.models.list().data]
-            server_online = True
-        except Exception:
+        if has_key:
+            try:
+                oai = get_openai_client(base_url=base_url)
+                available_models = [m.id for m in oai.models.list().data]
+                server_online = True
+            except Exception:
+                pass
+
+        if not available_models:
             available_models = [
                 "kanana_summarizer_full_ft_model",
                 "kakaocorp/kanana-nano-2.1b-instruct",
@@ -219,42 +258,37 @@ def create_fastapi_app():
                 "gpt-4o",
             ]
 
+        ft_info = get_finetuned_summarizer_info()
+        kanana_exists = bool(ft_info.get("exists"))
+
         return {
-            "configured": bool(key),
-            "server_online": server_online,
+            "configured": has_key,
+            "server_online": kanana_exists or server_online,
+            "kanana_available": kanana_exists,
             "base_url": base_url,
-            "masked_key": masked,
+            "masked_key": "설정됨 (.env)" if has_key else "미설정",
             "model": model,
+            "finetuned_model": "kanana_summarizer_full_ft_model",
+            "base_model": "kakaocorp/kanana-nano-2.1b-instruct",
             "available_models": available_models,
-            "orchestration_mode": "Multi-Agent Supervisor (OpenAI Head LLM)",
+            "orchestration_mode": (
+                "Fine-Tuned Kanana Model (kanana_summarizer_full_ft_model)"
+                if kanana_exists
+                else f"OpenAI API Fallback ({model})"
+            ),
         }
 
     @app.post("/api/openai-key")
     async def set_openai_key(req: OpenAIKeyRequest):
-        """웹 UI에서 변경한 OpenAI base_url, api_key, model을 환경변수 및 .env에 반영합니다."""
-        clean_url = (req.base_url or OPENAI_BASE_URL).strip()
-        clean_key = (req.api_key or OPENAI_API_KEY).strip()
-        clean_model = (req.model or OPENAI_MODEL).strip()
-        os.environ["OPENAI_BASE_URL"] = clean_url
-        os.environ["OPENAI_API_KEY"] = clean_key
-        os.environ["OPENAI_MODEL"] = clean_model
-
-        lines = []
-        if ENV_FILE.exists():
-            for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-                if not any(line.startswith(k) for k in ("OPENAI_BASE_URL=", "OPENAI_API_KEY=", "OPENAI_MODEL=")):
-                    lines.append(line)
-        lines.append(f"OPENAI_BASE_URL={clean_url}")
-        lines.append(f"OPENAI_API_KEY={clean_key}")
-        lines.append(f"OPENAI_MODEL={clean_model}")
-        ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-        masked = f"{clean_key[:11]}...{clean_key[-4:]}" if len(clean_key) > 15 else "설정됨"
+        """.env 파일에서 API 키를 다시 불러오고 선택된 base_url / model 설정을 확인합니다 (민감 정보는 .env에서만 로드)."""
+        load_env_config()
+        base_url, model = resolve_openai_config(req.base_url, req.model)
+        has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
         return {
-            "configured": True,
-            "base_url": clean_url,
-            "masked_key": masked,
-            "model": clean_model,
+            "configured": has_key,
+            "base_url": base_url,
+            "masked_key": "설정됨 (.env)" if has_key else "미설정",
+            "model": model,
         }
 
     @app.post("/api/analyze", response_model=AnalyzeResponse)
@@ -266,7 +300,6 @@ def create_fastapi_app():
         orchestrated_result = orchestrator.run(
             query=req.query.strip(),
             thread_id=req.thread_id,
-            openai_api_key=req.openai_api_key,
             openai_model=req.openai_model,
             openai_base_url=req.openai_base_url,
         )
@@ -280,7 +313,6 @@ def create_fastapi_app():
             press=req.press,
             title=req.title,
             content=req.content,
-            openai_api_key=req.openai_api_key,
             openai_model=req.openai_model,
             openai_base_url=req.openai_base_url,
         )
@@ -460,9 +492,25 @@ def create_fastapi_app():
     return app
 
 
-try:
-    app = create_fastapi_app()
-except Exception:
+_app_instance: Any = None
+
+
+def get_app() -> Any:
+    """FastAPI 앱 인스턴스를 지연 생성하여 반환합니다."""
+    global _app_instance
+    if _app_instance is None:
+        _app_instance = create_fastapi_app()
+    return _app_instance
+
+
+# `python frontend.py`를 직접 실행할 때는 가상환경(.venv) 생성 및 패키지 설치 후
+# 하위 프로세스(uvicorn)에서만 앱을 초기화하도록 하여 불필요한 이중 로딩 및 ImportError를 방지합니다.
+if __name__ != "__main__" and _BACKEND_IMPORTED:
+    try:
+        app = get_app()
+    except Exception:
+        app = None
+else:
     app = None
 
 
@@ -474,20 +522,34 @@ def get_venv_python() -> Path:
 
 
 def ensure_venv() -> Path:
-    """가상환경(.venv)이 없으면 새로 생성합니다."""
+    """가상환경(.venv)이 없거나 손상된 경우 새로 생성하고 pip를 준비합니다."""
     venv_python = get_venv_python()
-    if not venv_python.exists():
+    need_create = not venv_python.exists()
+    if not need_create:
+        pip_check = subprocess.run(
+            [str(venv_python), "-m", "pip", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        if pip_check.returncode != 0:
+            need_create = True
+
+    if need_create:
         print(f"[1/4] 가상환경을 생성합니다: {VENV_DIR}")
-        venv.create(VENV_DIR, with_pip=True)
+        venv.create(VENV_DIR, with_pip=True, clear=venv_python.exists())
     else:
         print(f"[1/4] 기존 가상환경을 확인했습니다: {VENV_DIR}")
     return venv_python
 
 
 def is_ui_ready(venv_python: Path) -> bool:
-    """가상환경에 필수 패키지(sqlite_vec, sklearn 포함)가 설치되어 있는지 확인합니다."""
+    """가상환경에 필수 패키지(fastapi, uvicorn, langgraph, numpy, openai, sqlite_vec, sklearn, dotenv, httpx, joblib)가 모두 설치되어 있는지 확인합니다."""
     check = subprocess.run(
-        [str(venv_python), "-c", "import fastapi, uvicorn, langgraph, numpy, openai, sqlite_vec, sklearn"],
+        [
+            str(venv_python),
+            "-c",
+            "import fastapi, uvicorn, langgraph, numpy, openai, sqlite_vec, sklearn, dotenv, httpx, joblib",
+        ],
         capture_output=True,
         text=True,
     )
@@ -495,18 +557,19 @@ def is_ui_ready(venv_python: Path) -> bool:
 
 
 def install_dependencies(venv_python: Path) -> None:
-    """requirements.txt, sqlite-vec, scikit-learn, openai 패키지를 가상환경에 설치합니다."""
-    print("[2/4] 패키지 설치 상태를 점검합니다...")
+    """requirements.txt 및 필수 구동 패키지를 가상환경(.venv)에 설치합니다."""
+    print("[2/4] 가상환경에 필수 패키지를 설치합니다...")
     subprocess.run(
         [str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
         check=False,
     )
 
     if REQ_FILE.exists():
-        print(f"      -> {REQ_FILE.name} 기준으로 패키지 설치를 시도합니다...")
+        print(f"      -> {REQ_FILE.name} 기준으로 패키지 설치를 진행합니다...")
         subprocess.run(
             [str(venv_python), "-m", "pip", "install", "-r", str(REQ_FILE)],
             cwd=str(ROOT_DIR),
+            check=False,
         )
 
     subprocess.run(
@@ -524,11 +587,12 @@ def install_dependencies(venv_python: Path) -> None:
             "openai",
             "sqlite-vec",
             "scikit-learn",
+            "joblib",
         ],
         cwd=str(ROOT_DIR),
         check=True,
     )
-    print("      -> 구동 패키지(sqlite-vec, scikit-learn, OpenAI 포함) 설치 완료!")
+    print("      -> 구동 패키지(sqlite-vec, scikit-learn, OpenAI, LangGraph 포함) 설치 완료!")
 
 
 def wait_and_open_browser(url: str, timeout_sec: float = 15.0) -> None:
@@ -548,19 +612,58 @@ def wait_and_open_browser(url: str, timeout_sec: float = 15.0) -> None:
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     if not HTML_FILE.exists():
         raise FileNotFoundError(f"확정된 UI 파일을 찾을 수 없습니다: {HTML_FILE}")
 
+    # 1. 가상환경(.venv) 자동 생성 및 필수 패키지 설치
     venv_python = ensure_venv()
     if not is_ui_ready(venv_python):
         install_dependencies(venv_python)
     else:
         print("[2/4] 필수 패키지(OpenAI API 및 LangGraph 포함)가 이미 가상환경에 설치되어 있습니다.")
 
+    # 2. 시스템 Python으로 실행된 경우, 생성된 가상환경(.venv)의 Python으로 자신을 재실행하여
+    #    이후 모든 실행 컨텍스트가 가상환경 내부에서 동작하도록 보장합니다.
+    try:
+        in_target_venv = Path(sys.executable).resolve() == venv_python.resolve()
+    except Exception:
+        in_target_venv = False
+
+    if not in_target_venv and os.environ.get("_FRONTEND_ACTIVE_VENV") != "1":
+        print(f"      -> 가상환경 Python으로 전환하여 실행합니다: {venv_python}")
+        child_env = os.environ.copy()
+        child_env["_FRONTEND_ACTIVE_VENV"] = "1"
+        child_env["VIRTUAL_ENV"] = str(VENV_DIR)
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        scripts_dir = str(venv_python.parent)
+        child_env["PATH"] = scripts_dir + os.pathsep + child_env.get("PATH", "")
+        proc = subprocess.Popen(
+            [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+            cwd=str(ROOT_DIR),
+            env=child_env,
+        )
+        try:
+            sys.exit(proc.wait())
+        except KeyboardInterrupt:
+            proc.terminate()
+            proc.wait(timeout=5)
+            sys.exit(0)
+
     print(
         f"[3/4] OpenAI Head LLM({OPENAI_BASE_URL}) 기반 Multi-Agent Orchestration 웹 서버를 시작합니다 ({URL})..."
     )
     print("      (종료하려면 터미널에서 Ctrl+C 를 누르세요)")
+
+    server_env = os.environ.copy()
+    server_env["VIRTUAL_ENV"] = str(VENV_DIR)
+    server_env["PYTHONIOENCODING"] = "utf-8"
 
     server_proc = subprocess.Popen(
         [
@@ -575,6 +678,7 @@ def main() -> None:
             "--reload",
         ],
         cwd=str(ROOT_DIR),
+        env=server_env,
     )
 
     try:
@@ -588,6 +692,7 @@ def main() -> None:
 
 __all__ = [
     "create_fastapi_app",
+    "get_app",
     "app",
     "get_venv_python",
     "ensure_venv",
