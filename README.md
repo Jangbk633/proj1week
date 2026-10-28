@@ -30,3 +30,5 @@ app.py            : frontend.py의 FastAPI 앱 객체를 재노출하는 엔트�
 slm_server.py     : 로컬 SLM 모델 탐색·다운로드 및 llama-server.exe 자동 기동  
 summary_engine.py : LocalKananaSummarizer 기반 로컬 GPU 뉴스 요약 생성  
 summary.py        : 로컬 SLM 뉴스 요약 대시보드 UI, 단건/배치 요약 REST API, OpenAI 호환 프록시 서버 및 CLI 런처  
+---
+.env파일에 로컬 SLM에 대한 내용이 없으면 요약기로 openai모델을 사용합니다
